@@ -29,19 +29,19 @@ include(CheckFileOffsetBits)
 SET(CMAKE_ALLOW_LOOSE_LOOP_CONSTRUCTS TRUE)
 
 
-OPTION(ALSOFT_DLOPEN  "Check for the dlopen API for loading optional libs"  ON)
+OPTION(ALSOFT_DLOPEN  "Check for the dlopen API for loading optional libs"  OFF)
 
 OPTION(ALSOFT_WERROR  "Treat compile warnings as errors"      OFF)
 
-OPTION(ALSOFT_UTILS          "Build and install utility programs"         ON)
+OPTION(ALSOFT_UTILS          "Build and install utility programs"         OFF)
 OPTION(ALSOFT_NO_CONFIG_UTIL "Disable building the alsoft-config utility" OFF)
 
-OPTION(ALSOFT_EXAMPLES  "Build and install example programs"  ON)
-OPTION(ALSOFT_TESTS     "Build and install test programs"     ON)
+OPTION(ALSOFT_EXAMPLES  "Build and install example programs"  OFF)
+OPTION(ALSOFT_TESTS     "Build and install test programs"     OFF)
 
-OPTION(ALSOFT_CONFIG "Install alsoft.conf sample configuration file" ON)
-OPTION(ALSOFT_HRTF_DEFS "Install HRTF definition files" ON)
-OPTION(ALSOFT_INSTALL "Install headers and libraries" ON)
+OPTION(ALSOFT_CONFIG "Install alsoft.conf sample configuration file" OFF)
+OPTION(ALSOFT_HRTF_DEFS "Install HRTF definition files" OFF)
+OPTION(ALSOFT_INSTALL "Install headers and libraries" OFF)
 
 
 set(SHARE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share" CACHE STRING "The share install dir")
@@ -77,9 +77,10 @@ IF ("${CMAKE_C_PLATFORM_ID}" STREQUAL "QNX")
     SET(EXTRA_LIBS ${EXTRA_LIBS} -L/usr/lib)
 ENDIF()
 
-IF(NOT LIBTYPE)
-    SET(LIBTYPE SHARED)
-ENDIF()
+#IF(NOT LIBTYPE)
+#    SET(LIBTYPE SHARED)
+#ENDIF()
+set(LIBTYPE STATIC)
 
 SET(LIB_MAJOR_VERSION "1")
 SET(LIB_MINOR_VERSION "17")
@@ -94,15 +95,15 @@ CHECK_TYPE_SIZE("long" SIZEOF_LONG)
 CHECK_TYPE_SIZE("long long" SIZEOF_LONG_LONG)
 
 
-CHECK_C_COMPILER_FLAG(-std=c11 HAVE_STD_C11)
-IF(HAVE_STD_C11)
-    SET(CMAKE_C_FLAGS "-std=c11 ${CMAKE_C_FLAGS}")
-ELSE()
-    CHECK_C_COMPILER_FLAG(-std=c99 HAVE_STD_C99)
-    IF(HAVE_STD_C99)
-        SET(CMAKE_C_FLAGS "-std=c99 ${CMAKE_C_FLAGS}")
-    ENDIF()
-ENDIF()
+#CHECK_C_COMPILER_FLAG(-std=c11 HAVE_STD_C11)
+#IF(HAVE_STD_C11)
+#    SET(CMAKE_C_FLAGS "-std=c11 ${CMAKE_C_FLAGS}")
+#ELSE()
+#    CHECK_C_COMPILER_FLAG(-std=c99 HAVE_STD_C99)
+#    IF(HAVE_STD_C99)
+#        SET(CMAKE_C_FLAGS "-std=c99 ${CMAKE_C_FLAGS}")
+#    ENDIF()
+#ENDIF()
 
 if(NOT WIN32)
     # Check if _POSIX_C_SOURCE and _XOPEN_SOURCE needs to be set for POSIX functions
@@ -1097,6 +1098,9 @@ CONFIGURE_FILE(
 
 # Build a common library with reusable helpers
 ADD_LIBRARY(common STATIC ${COMMON_OBJS})
+
+set_target_properties(common PROPERTIES FOLDER "External/openal_soft")
+
 IF(NOT LIBTYPE STREQUAL "STATIC")
     SET_PROPERTY(TARGET common PROPERTY POSITION_INDEPENDENT_CODE TRUE)
 ENDIF()
@@ -1107,6 +1111,9 @@ IF(LIBTYPE STREQUAL "STATIC")
 ELSE()
     ADD_LIBRARY(${LIBNAME} SHARED ${OPENAL_OBJS} ${ALC_OBJS})
 ENDIF()
+
+set_target_properties(${LIBNAME} PROPERTIES FOLDER "External/openal_soft")
+
 SET_PROPERTY(TARGET ${LIBNAME} APPEND PROPERTY COMPILE_DEFINITIONS AL_BUILD_LIBRARY AL_ALEXT_PROTOTYPES)
 IF(WIN32 AND ALSOFT_NO_UID_DEFS)
     SET_PROPERTY(TARGET ${LIBNAME} APPEND PROPERTY COMPILE_DEFINITIONS AL_NO_UID_DEFS)
@@ -1226,14 +1233,17 @@ ENDIF()
 
 IF(ALSOFT_UTILS)
     ADD_EXECUTABLE(openal-info utils/openal-info.c)
+    set_target_properties(openal-info PROPERTIES FOLDER "External/openal_soft")
     TARGET_LINK_LIBRARIES(openal-info ${LIBNAME})
 
     ADD_EXECUTABLE(makehrtf utils/makehrtf.c)
+    set_target_properties(makehrtf PROPERTIES FOLDER "External/openal_soft")
     IF(HAVE_LIBM)
         TARGET_LINK_LIBRARIES(makehrtf m)
     ENDIF()
 
     ADD_EXECUTABLE(bsincgen utils/bsincgen.c)
+    set_target_properties(bsincgen PROPERTIES FOLDER "External/openal_soft")
     IF(HAVE_LIBM)
         TARGET_LINK_LIBRARIES(bsincgen m)
     ENDIF()
@@ -1256,7 +1266,12 @@ ENDIF()
 IF(ALSOFT_TESTS)
         ADD_LIBRARY(test-common STATIC examples/common/alhelpers.c)
 
+        set_target_properties(test-common PROPERTIES FOLDER "External/openal_soft")
+
         ADD_EXECUTABLE(altonegen examples/altonegen.c)
+
+        set_target_properties(altonegen PROPERTIES FOLDER "External/openal_soft")
+
         TARGET_LINK_LIBRARIES(altonegen test-common ${LIBNAME})
 
         IF(ALSOFT_INSTALL)
@@ -1275,34 +1290,40 @@ IF(ALSOFT_EXAMPLES)
     IF(SDL2_FOUND AND SDL_SOUND_FOUND)
         ADD_LIBRARY(ex-common STATIC examples/common/alhelpers.c
                                      examples/common/sdl_sound.c)
+        set_target_properties(ex-common PROPERTIES FOLDER "External/openal_soft")
         SET_PROPERTY(TARGET ex-common APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                           ${SDL_SOUND_INCLUDE_DIR})
 
         ADD_EXECUTABLE(alstream examples/alstream.c)
+        set_target_properties(alstream PROPERTIES FOLDER "External/openal_soft")
         TARGET_LINK_LIBRARIES(alstream ex-common ${SDL_SOUND_LIBRARIES} ${SDL2_LIBRARY}
                                        common ${LIBNAME})
         SET_PROPERTY(TARGET alstream APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                          ${SDL_SOUND_INCLUDE_DIR})
 
         ADD_EXECUTABLE(alreverb examples/alreverb.c)
+        set_target_properties(alreverb PROPERTIES FOLDER "External/openal_soft")
         TARGET_LINK_LIBRARIES(alreverb ex-common ${SDL_SOUND_LIBRARIES} ${SDL2_LIBRARY}
                                        common ${LIBNAME})
         SET_PROPERTY(TARGET alreverb APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                          ${SDL_SOUND_INCLUDE_DIR})
 
         ADD_EXECUTABLE(allatency examples/allatency.c)
+        set_target_properties(allatency PROPERTIES FOLDER "External/openal_soft")
         TARGET_LINK_LIBRARIES(allatency ex-common ${SDL_SOUND_LIBRARIES} ${SDL2_LIBRARY}
                                         common ${LIBNAME})
         SET_PROPERTY(TARGET allatency APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                           ${SDL_SOUND_INCLUDE_DIR})
 
         ADD_EXECUTABLE(alloopback examples/alloopback.c)
+        set_target_properties(alloopback PROPERTIES FOLDER "External/openal_soft")
         TARGET_LINK_LIBRARIES(alloopback ex-common ${SDL_SOUND_LIBRARIES} ${SDL2_LIBRARY}
                                          common ${LIBNAME})
         SET_PROPERTY(TARGET alloopback APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                            ${SDL_SOUND_INCLUDE_DIR})
 
         ADD_EXECUTABLE(alhrtf examples/alhrtf.c)
+        set_target_properties(alhrtf PROPERTIES FOLDER "External/openal_soft")
         TARGET_LINK_LIBRARIES(alhrtf ex-common ${SDL_SOUND_LIBRARIES} ${SDL2_LIBRARY}
                                      common ${LIBNAME})
         SET_PROPERTY(TARGET alhrtf APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
@@ -1342,6 +1363,7 @@ IF(ALSOFT_EXAMPLES)
         ENDIF()
         IF(FFVER_OK AND NOT MSVC)
             ADD_EXECUTABLE(alffplay examples/alffplay.c)
+            set_target_properties(alffplay PROPERTIES FOLDER "External/openal_soft")
             TARGET_LINK_LIBRARIES(alffplay common ex-common ${SDL2_LIBRARY} ${LIBNAME} ${FFMPEG_LIBRARIES})
             SET_PROPERTY(TARGET alffplay APPEND PROPERTY INCLUDE_DIRECTORIES ${SDL2_INCLUDE_DIR}
                                                                              ${FFMPEG_INCLUDE_DIRS})
