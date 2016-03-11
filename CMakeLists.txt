@@ -54,7 +54,7 @@ set(SHARE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share" CACHE STRING "The share in
 IF(NOT WIN32)
     SET(LIBNAME openal)
 ELSE()
-    SET(LIBNAME OpenAL32)
+    SET(LIBNAME openal)
     ADD_DEFINITIONS("-D_WIN32 -D_WIN32_WINNT=0x0502")
 
     # This option is mainly for static linking OpenAL Soft into another project
@@ -1386,3 +1386,5 @@ IF(ALSOFT_EXAMPLES)
         MESSAGE(STATUS "")
     ENDIF()
 ENDIF()
+
+target_include_directories(${LIBNAME} PUBLIC ${OpenAL_SOURCE_DIR}/include)

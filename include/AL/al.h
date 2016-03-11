@@ -5,6 +5,11 @@
 extern "C" {
 #endif
 
+// Enforce static linking.
+#ifndef AL_LIBTYPE_STATIC
+#define AL_LIBTYPE_STATIC
+#endif
+
 #ifndef AL_API
  #if defined(AL_LIBTYPE_STATIC)
   #define AL_API
