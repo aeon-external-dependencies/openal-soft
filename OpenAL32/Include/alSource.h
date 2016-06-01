@@ -13,6 +13,7 @@ extern "C" {
 
 struct ALbuffer;
 struct ALsource;
+struct ALsourceProps;
 
 
 typedef struct ALbufferlistitem {
@@ -24,11 +25,10 @@ typedef struct ALbufferlistitem {
 typedef struct ALvoice {
     struct ALsource *volatile Source;
 
-    /** Method to update mixing parameters. */
-    ALvoid (*Update)(struct ALvoice *self, const struct ALsource *source, const ALCcontext *context);
-
     /** Current target parameters used for mixing. */
     ALint Step;
+
+    ALboolean Looping;
 
     /* If not 'moving', gain/coefficients are set directly without fading. */
     ALboolean Moving;
@@ -46,6 +46,59 @@ typedef struct ALvoice {
 } ALvoice;
 
 
+struct ALsourceProps {
+    ATOMIC(ALfloat)   Pitch;
+    ATOMIC(ALfloat)   Gain;
+    ATOMIC(ALfloat)   OuterGain;
+    ATOMIC(ALfloat)   MinGain;
+    ATOMIC(ALfloat)   MaxGain;
+    ATOMIC(ALfloat)   InnerAngle;
+    ATOMIC(ALfloat)   OuterAngle;
+    ATOMIC(ALfloat)   RefDistance;
+    ATOMIC(ALfloat)   MaxDistance;
+    ATOMIC(ALfloat)   RollOffFactor;
+    ATOMIC(ALfloat)   Position[3];
+    ATOMIC(ALfloat)   Velocity[3];
+    ATOMIC(ALfloat)   Direction[3];
+    ATOMIC(ALfloat)   Orientation[2][3];
+    ATOMIC(ALboolean) HeadRelative;
+    ATOMIC(ALboolean) Looping;
+    ATOMIC(enum DistanceModel) DistanceModel;
+    ATOMIC(ALboolean) DirectChannels;
+
+    ATOMIC(ALboolean) DryGainHFAuto;
+    ATOMIC(ALboolean) WetGainAuto;
+    ATOMIC(ALboolean) WetGainHFAuto;
+    ATOMIC(ALfloat)   OuterGainHF;
+
+    ATOMIC(ALfloat) AirAbsorptionFactor;
+    ATOMIC(ALfloat) RoomRolloffFactor;
+    ATOMIC(ALfloat) DopplerFactor;
+
+    ATOMIC(ALfloat) StereoPan[2];
+
+    ATOMIC(ALfloat) Radius;
+
+    /** Direct filter and auxiliary send info. */
+    struct {
+        ATOMIC(ALfloat) Gain;
+        ATOMIC(ALfloat) GainHF;
+        ATOMIC(ALfloat) HFReference;
+        ATOMIC(ALfloat) GainLF;
+        ATOMIC(ALfloat) LFReference;
+    } Direct;
+    struct {
+        ATOMIC(struct ALeffectslot*) Slot;
+        ATOMIC(ALfloat) Gain;
+        ATOMIC(ALfloat) GainHF;
+        ATOMIC(ALfloat) HFReference;
+        ATOMIC(ALfloat) GainLF;
+        ATOMIC(ALfloat) LFReference;
+    } Send[MAX_SENDS];
+
+    ATOMIC(struct ALsourceProps*) next;
+};
+
 typedef struct ALsource {
     /** Source properties. */
     volatile ALfloat   Pitch;
@@ -58,9 +111,9 @@ typedef struct ALsource {
     volatile ALfloat   RefDistance;
     volatile ALfloat   MaxDistance;
     volatile ALfloat   RollOffFactor;
-    aluVector Position;
-    aluVector Velocity;
-    aluVector Direction;
+    volatile ALfloat   Position[3];
+    volatile ALfloat   Velocity[3];
+    volatile ALfloat   Direction[3];
     volatile ALfloat   Orientation[2][3];
     volatile ALboolean HeadRelative;
     volatile ALboolean Looping;
@@ -76,7 +129,29 @@ typedef struct ALsource {
     volatile ALfloat RoomRolloffFactor;
     volatile ALfloat DopplerFactor;
 
+    /* NOTE: Stereo pan angles are specified in radians, counter-clockwise
+     * rather than clockwise.
+     */
+    volatile ALfloat StereoPan[2];
+
     volatile ALfloat Radius;
+
+    /** Direct filter and auxiliary send info. */
+    struct {
+        ALfloat Gain;
+        ALfloat GainHF;
+        ALfloat HFReference;
+        ALfloat GainLF;
+        ALfloat LFReference;
+    } Direct;
+    struct {
+        struct ALeffectslot *Slot;
+        ALfloat Gain;
+        ALfloat GainHF;
+        ALfloat HFReference;
+        ALfloat GainLF;
+        ALfloat LFReference;
+    } Send[MAX_SENDS];
 
     /**
      * Last user-specified offset, and the offset type (bytes, samples, or
@@ -97,8 +172,8 @@ typedef struct ALsource {
      * the whole queue, and the fractional (fixed-point) offset to the next
      * sample.
      */
-    ALuint position;
-    ALuint position_fraction;
+    ATOMIC(ALuint) position;
+    ATOMIC(ALuint) position_fraction;
 
     /** Source Buffer Queue info. */
     ATOMIC(ALbufferlistitem*) queue;
@@ -109,35 +184,29 @@ typedef struct ALsource {
     ALuint NumChannels;
     ALuint SampleSize;
 
-    /** Direct filter and auxiliary send info. */
-    struct {
-        ALfloat Gain;
-        ALfloat GainHF;
-        ALfloat HFReference;
-        ALfloat GainLF;
-        ALfloat LFReference;
-    } Direct;
-    struct {
-        struct ALeffectslot *Slot;
-        ALfloat Gain;
-        ALfloat GainHF;
-        ALfloat HFReference;
-        ALfloat GainLF;
-        ALfloat LFReference;
-    } Send[MAX_SENDS];
-
-    /** Source needs to update its mixing parameters. */
-    ATOMIC(ALenum) NeedsUpdate;
+    ATOMIC(struct ALsourceProps*) Update;
+    ATOMIC(struct ALsourceProps*) FreeList;
 
     /** Self ID */
     ALuint id;
 } ALsource;
 
-inline struct ALsource *LookupSource(ALCcontext *context, ALuint id)
-{ return (struct ALsource*)LookupUIntMapKey(&context->SourceMap, id); }
-inline struct ALsource *RemoveSource(ALCcontext *context, ALuint id)
-{ return (struct ALsource*)RemoveUIntMapKey(&context->SourceMap, id); }
+inline void LockSourcesRead(ALCcontext *context)
+{ LockUIntMapRead(&context->SourceMap); }
+inline void UnlockSourcesRead(ALCcontext *context)
+{ UnlockUIntMapRead(&context->SourceMap); }
+inline void LockSourcesWrite(ALCcontext *context)
+{ LockUIntMapWrite(&context->SourceMap); }
+inline void UnlockSourcesWrite(ALCcontext *context)
+{ UnlockUIntMapWrite(&context->SourceMap); }
 
+inline struct ALsource *LookupSource(ALCcontext *context, ALuint id)
+{ return (struct ALsource*)LookupUIntMapKeyNoLock(&context->SourceMap, id); }
+inline struct ALsource *RemoveSource(ALCcontext *context, ALuint id)
+{ return (struct ALsource*)RemoveUIntMapKeyNoLock(&context->SourceMap, id); }
+
+void UpdateSourceProps(ALsource *source, ALuint num_sends, ALCcontext *context);
+void UpdateAllSourceProps(ALCcontext *context);
 ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state);
 ALboolean ApplyOffset(ALsource *Source);
 

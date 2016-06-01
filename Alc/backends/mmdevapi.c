@@ -211,7 +211,7 @@ static void add_device(IMMDevice *device, LPCWSTR devid, vector_DevMap *list)
 
 #define MATCH_ENTRY(i) (al_string_cmp(entry.name, (i)->name) == 0)
         VECTOR_FIND_IF(iter, const DevMap, *list, MATCH_ENTRY);
-        if(iter == VECTOR_ITER_END(*list)) break;
+        if(iter == VECTOR_END(*list)) break;
 #undef MATCH_ENTRY
         count++;
     }
@@ -508,7 +508,7 @@ static void ALCmmdevPlayback_stop(ALCmmdevPlayback *self);
 static void ALCmmdevPlayback_stopProxy(ALCmmdevPlayback *self);
 static DECLARE_FORWARD2(ALCmmdevPlayback, ALCbackend, ALCenum, captureSamples, ALCvoid*, ALCuint)
 static DECLARE_FORWARD(ALCmmdevPlayback, ALCbackend, ALCuint, availableSamples)
-static ALint64 ALCmmdevPlayback_getLatency(ALCmmdevPlayback *self);
+static ClockLatency ALCmmdevPlayback_getClockLatency(ALCmmdevPlayback *self);
 static DECLARE_FORWARD(ALCmmdevPlayback, ALCbackend, void, lock)
 static DECLARE_FORWARD(ALCmmdevPlayback, ALCbackend, void, unlock)
 DECLARE_DEFAULT_ALLOCATORS(ALCmmdevPlayback)
@@ -696,7 +696,7 @@ static ALCenum ALCmmdevPlayback_open(ALCmmdevPlayback *self, const ALCchar *devi
             hr = E_FAIL;
 #define MATCH_NAME(i) (al_string_cmp_cstr((i)->name, deviceName) == 0)
             VECTOR_FIND_IF(iter, const DevMap, PlaybackDevices, MATCH_NAME);
-            if(iter == VECTOR_ITER_END(PlaybackDevices))
+            if(iter == VECTOR_END(PlaybackDevices))
                 WARN("Failed to find device name matching \"%s\"\n", deviceName);
             else
             {
@@ -1139,10 +1139,17 @@ static void ALCmmdevPlayback_stopProxy(ALCmmdevPlayback *self)
 }
 
 
-static ALint64 ALCmmdevPlayback_getLatency(ALCmmdevPlayback *self)
+static ClockLatency ALCmmdevPlayback_getClockLatency(ALCmmdevPlayback *self)
 {
     ALCdevice *device = STATIC_CAST(ALCbackend, self)->mDevice;
-    return (ALint64)self->Padding * 1000000000 / device->Frequency;
+    ClockLatency ret;
+
+    ALCmmdevPlayback_lock(self);
+    ret.ClockTime = GetDeviceClockTime(device);
+    ret.Latency = self->Padding * DEVICE_CLOCK_RES / device->Frequency;
+    ALCmmdevPlayback_unlock(self);
+
+    return ret;
 }
 
 
@@ -1181,7 +1188,7 @@ static void ALCmmdevCapture_stop(ALCmmdevCapture *self);
 static void ALCmmdevCapture_stopProxy(ALCmmdevCapture *self);
 static ALCenum ALCmmdevCapture_captureSamples(ALCmmdevCapture *self, ALCvoid *buffer, ALCuint samples);
 static ALuint ALCmmdevCapture_availableSamples(ALCmmdevCapture *self);
-static DECLARE_FORWARD(ALCmmdevCapture, ALCbackend, ALint64, getLatency)
+static DECLARE_FORWARD(ALCmmdevCapture, ALCbackend, ClockLatency, getClockLatency)
 static DECLARE_FORWARD(ALCmmdevCapture, ALCbackend, void, lock)
 static DECLARE_FORWARD(ALCmmdevCapture, ALCbackend, void, unlock)
 DECLARE_DEFAULT_ALLOCATORS(ALCmmdevCapture)
@@ -1332,7 +1339,7 @@ static ALCenum ALCmmdevCapture_open(ALCmmdevCapture *self, const ALCchar *device
             hr = E_FAIL;
 #define MATCH_NAME(i) (al_string_cmp_cstr((i)->name, deviceName) == 0)
             VECTOR_FIND_IF(iter, const DevMap, CaptureDevices, MATCH_NAME);
-            if(iter == VECTOR_ITER_END(CaptureDevices))
+            if(iter == VECTOR_END(CaptureDevices))
                 WARN("Failed to find device name matching \"%s\"\n", deviceName);
             else
             {
@@ -1574,9 +1581,10 @@ static HRESULT ALCmmdevCapture_resetProxy(ALCmmdevCapture *self)
        wfx->nChannels != OutputType.Format.nChannels ||
        wfx->nBlockAlign != OutputType.Format.nBlockAlign)
     {
-        ERR("Did not get matching format, wanted: %s %s %uhz, got: %d channel(s) %d-bit %luhz\n",
-            DevFmtChannelsString(device->FmtChans), DevFmtTypeString(device->FmtType), device->Frequency,
-            wfx->nChannels, wfx->wBitsPerSample, wfx->nSamplesPerSec);
+        ERR("Failed to get matching format, wanted: %s %s %uhz, got: %d channel%s %d-bit %luhz\n",
+            DevFmtChannelsString(device->FmtChans), DevFmtTypeString(device->FmtType),
+            device->Frequency, wfx->nChannels, (wfx->nChannels==1)?"":"s", wfx->wBitsPerSample,
+            wfx->nSamplesPerSec);
         CoTaskMemFree(wfx);
         return E_FAIL;
     }

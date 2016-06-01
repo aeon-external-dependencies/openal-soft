@@ -87,8 +87,9 @@ typedef struct ALequalizerState {
     ALfloat SampleBuffer[4][MAX_EFFECT_CHANNELS][MAX_UPDATE_SAMPLES];
 } ALequalizerState;
 
-static ALvoid ALequalizerState_Destruct(ALequalizerState *UNUSED(state))
+static ALvoid ALequalizerState_Destruct(ALequalizerState *state)
 {
+    ALeffectState_Destruct(STATIC_CAST(ALeffectState,state));
 }
 
 static ALboolean ALequalizerState_deviceUpdate(ALequalizerState *UNUSED(state), ALCdevice *UNUSED(device))
@@ -96,30 +97,32 @@ static ALboolean ALequalizerState_deviceUpdate(ALequalizerState *UNUSED(state), 
     return AL_TRUE;
 }
 
-static ALvoid ALequalizerState_update(ALequalizerState *state, const ALCdevice *device, const ALeffectslot *slot)
+static ALvoid ALequalizerState_update(ALequalizerState *state, const ALCdevice *device, const ALeffectslot *slot, const ALeffectProps *props)
 {
     ALfloat frequency = (ALfloat)device->Frequency;
     ALfloat gain, freq_mult;
     aluMatrixf matrix;
     ALuint i;
 
-    gain = device->AmbiScale;
     aluMatrixfSet(&matrix,
         1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, gain, 0.0f, 0.0f,
-        0.0f, 0.0f, gain, 0.0f,
-        0.0f, 0.0f, 0.0f, gain
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
     );
+
+    STATIC_CAST(ALeffectState,state)->OutBuffer = device->FOAOut.Buffer;
+    STATIC_CAST(ALeffectState,state)->OutChannels = device->FOAOut.NumChannels;
     for(i = 0;i < MAX_EFFECT_CHANNELS;i++)
-        ComputeFirstOrderGains(device->AmbiCoeffs, device->NumChannels,
-                               matrix.m[i], slot->Gain, state->Gain[i]);
+        ComputeFirstOrderGains(device->FOAOut, matrix.m[i], slot->Params.Gain,
+                               state->Gain[i]);
 
     /* Calculate coefficients for the each type of filter. Note that the shelf
      * filters' gain is for the reference frequency, which is the centerpoint
      * of the transition band.
      */
-    gain = sqrtf(slot->EffectProps.Equalizer.LowGain);
-    freq_mult = slot->EffectProps.Equalizer.LowCutoff/frequency;
+    gain = sqrtf(props->Equalizer.LowGain);
+    freq_mult = props->Equalizer.LowCutoff/frequency;
     ALfilterState_setParams(&state->filter[0][0], ALfilterType_LowShelf,
         gain, freq_mult, calc_rcpQ_from_slope(gain, 0.75f)
     );
@@ -134,10 +137,12 @@ static ALvoid ALequalizerState_update(ALequalizerState *state, const ALCdevice *
         state->filter[0][i].process = state->filter[0][0].process;
     }
 
-    gain = slot->EffectProps.Equalizer.Mid1Gain;
-    freq_mult = slot->EffectProps.Equalizer.Mid1Center/frequency;
+    gain = props->Equalizer.Mid1Gain;
+    freq_mult = props->Equalizer.Mid1Center/frequency;
     ALfilterState_setParams(&state->filter[1][0], ALfilterType_Peaking,
-        gain, freq_mult, calc_rcpQ_from_bandwidth(freq_mult, slot->EffectProps.Equalizer.Mid1Width)
+        gain, freq_mult, calc_rcpQ_from_bandwidth(
+            freq_mult, props->Equalizer.Mid1Width
+        )
     );
     for(i = 1;i < MAX_EFFECT_CHANNELS;i++)
     {
@@ -149,10 +154,12 @@ static ALvoid ALequalizerState_update(ALequalizerState *state, const ALCdevice *
         state->filter[1][i].process = state->filter[1][0].process;
     }
 
-    gain = slot->EffectProps.Equalizer.Mid2Gain;
-    freq_mult = slot->EffectProps.Equalizer.Mid2Center/frequency;
+    gain = props->Equalizer.Mid2Gain;
+    freq_mult = props->Equalizer.Mid2Center/frequency;
     ALfilterState_setParams(&state->filter[2][0], ALfilterType_Peaking,
-        gain, freq_mult, calc_rcpQ_from_bandwidth(freq_mult, slot->EffectProps.Equalizer.Mid2Width)
+        gain, freq_mult, calc_rcpQ_from_bandwidth(
+            freq_mult, props->Equalizer.Mid2Width
+        )
     );
     for(i = 1;i < MAX_EFFECT_CHANNELS;i++)
     {
@@ -164,8 +171,8 @@ static ALvoid ALequalizerState_update(ALequalizerState *state, const ALCdevice *
         state->filter[2][i].process = state->filter[2][0].process;
     }
 
-    gain = sqrtf(slot->EffectProps.Equalizer.HighGain);
-    freq_mult = slot->EffectProps.Equalizer.HighCutoff/frequency;
+    gain = sqrtf(props->Equalizer.HighGain);
+    freq_mult = props->Equalizer.HighCutoff/frequency;
     ALfilterState_setParams(&state->filter[3][0], ALfilterType_HighShelf,
         gain, freq_mult, calc_rcpQ_from_slope(gain, 0.75f)
     );

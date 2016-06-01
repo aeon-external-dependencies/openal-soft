@@ -1,6 +1,7 @@
 
 #include "config.h"
 
+#include <iostream>
 #include <cmath>
 
 #include <QFileDialog>
@@ -277,7 +278,7 @@ MainWindow::MainWindow(QWidget *parent) :
     mPeriodCountValidator = new QIntValidator(2, 16, this);
     ui->periodCountEdit->setValidator(mPeriodCountValidator);
 
-    mSourceCountValidator = new QIntValidator(0, 256, this);
+    mSourceCountValidator = new QIntValidator(0, 4096, this);
     ui->srcCountLineEdit->setValidator(mSourceCountValidator);
     mEffectSlotValidator = new QIntValidator(0, 16, this);
     ui->effectSlotLineEdit->setValidator(mEffectSlotValidator);
@@ -311,6 +312,19 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->periodCountEdit, SIGNAL(editingFinished()), this, SLOT(updatePeriodCountSlider()));
 
     connect(ui->stereoPanningComboBox, SIGNAL(currentIndexChanged(QString)), this, SLOT(enableApplyButton()));
+
+    connect(ui->decoderHQModeCheckBox, SIGNAL(stateChanged(int)), this, SLOT(toggleHqState(int)));
+    connect(ui->decoderDistCompCheckBox, SIGNAL(stateChanged(int)), this, SLOT(enableApplyButton()));
+    connect(ui->decoderQuadLineEdit, SIGNAL(textChanged(QString)), this, SLOT(enableApplyButton()));
+    connect(ui->decoderQuadButton, SIGNAL(clicked()), this, SLOT(selectQuadDecoderFile()));
+    connect(ui->decoder51LineEdit, SIGNAL(textChanged(QString)), this, SLOT(enableApplyButton()));
+    connect(ui->decoder51Button, SIGNAL(clicked()), this, SLOT(select51DecoderFile()));
+    connect(ui->decoder51RearLineEdit, SIGNAL(textChanged(QString)), this, SLOT(enableApplyButton()));
+    connect(ui->decoder51RearButton, SIGNAL(clicked()), this, SLOT(select51RearDecoderFile()));
+    connect(ui->decoder61LineEdit, SIGNAL(textChanged(QString)), this, SLOT(enableApplyButton()));
+    connect(ui->decoder61Button, SIGNAL(clicked()), this, SLOT(select61DecoderFile()));
+    connect(ui->decoder71LineEdit, SIGNAL(textChanged(QString)), this, SLOT(enableApplyButton()));
+    connect(ui->decoder71Button, SIGNAL(clicked()), this, SLOT(select71DecoderFile()));
 
     connect(ui->preferredHrtfComboBox, SIGNAL(currentIndexChanged(const QString&)), this, SLOT(enableApplyButton()));
     connect(ui->hrtfStateComboBox, SIGNAL(currentIndexChanged(const QString&)), this, SLOT(enableApplyButton()));
@@ -610,6 +624,18 @@ void MainWindow::loadConfig(const QString &fname)
         }
     }
 
+    bool hqmode = settings.value("decoder/hq-mode", false).toBool();
+    ui->decoderHQModeCheckBox->setChecked(hqmode);
+    bool distcomp = settings.value("decoder/distance-comp", true).toBool();
+    ui->decoderDistCompCheckBox->setChecked(distcomp);
+    ui->decoderDistCompCheckBox->setEnabled(hqmode);
+
+    ui->decoderQuadLineEdit->setText(settings.value("decoder/quad").toString());
+    ui->decoder51LineEdit->setText(settings.value("decoder/surround51").toString());
+    ui->decoder51RearLineEdit->setText(settings.value("decoder/surround51rear").toString());
+    ui->decoder61LineEdit->setText(settings.value("decoder/surround61").toString());
+    ui->decoder71LineEdit->setText(settings.value("decoder/surround71").toString());
+
     QStringList disabledCpuExts = settings.value("disable-cpu-exts").toStringList();
     if(disabledCpuExts.size() == 1)
         disabledCpuExts = disabledCpuExts[0].split(QChar(','));
@@ -826,6 +852,19 @@ void MainWindow::saveConfig(const QString &fname) const
     settings.setValue("stereo-mode", getValueFromName(stereoModeList, ui->stereoModeCombo->currentText()));
     settings.setValue("stereo-panning", getValueFromName(stereoPanList, ui->stereoPanningComboBox->currentText()));
 
+    settings.setValue("decoder/hq-mode",
+        ui->decoderHQModeCheckBox->isChecked() ? QString("true") : QString(/*"false"*/)
+    );
+    settings.setValue("decoder/distance-comp",
+        ui->decoderDistCompCheckBox->isChecked() ? QString(/*"true"*/) : QString("false")
+    );
+
+    settings.setValue("decoder/quad", ui->decoderQuadLineEdit->text());
+    settings.setValue("decoder/surround51", ui->decoder51LineEdit->text());
+    settings.setValue("decoder/surround51rear", ui->decoder51RearLineEdit->text());
+    settings.setValue("decoder/surround61", ui->decoder61LineEdit->text());
+    settings.setValue("decoder/surround71", ui->decoder71LineEdit->text());
+
     QStringList strlist;
     if(!ui->enableSSECheckBox->isChecked())
         strlist.append("sse");
@@ -1035,6 +1074,49 @@ void MainWindow::updatePeriodCountSlider()
 }
 
 
+void MainWindow::toggleHqState(int state)
+{
+    ui->decoderDistCompCheckBox->setEnabled(state);
+    enableApplyButton();
+}
+
+void MainWindow::selectQuadDecoderFile()
+{ selectDecoderFile(ui->decoderQuadLineEdit, "Select Quadrophonic Decoder");}
+void MainWindow::select51DecoderFile()
+{ selectDecoderFile(ui->decoder51LineEdit, "Select 5.1 Surround (Side) Decoder");}
+void MainWindow::select51RearDecoderFile()
+{ selectDecoderFile(ui->decoder51RearLineEdit, "Select 5.1 Surround (Rear) Decoder");}
+void MainWindow::select61DecoderFile()
+{ selectDecoderFile(ui->decoder61LineEdit, "Select 6.1 Surround Decoder");}
+void MainWindow::select71DecoderFile()
+{ selectDecoderFile(ui->decoder71LineEdit, "Select 7.1 Surround Decoder");}
+void MainWindow::selectDecoderFile(QLineEdit *line, const char *caption)
+{
+    QString dir = line->text();
+    if(dir.isEmpty() || QDir::isRelativePath(dir))
+    {
+        QStringList paths = getAllDataPaths("/openal/presets");
+        while(!paths.isEmpty())
+        {
+            if(QDir(paths.last()).exists())
+            {
+                dir = paths.last();
+                break;
+            }
+            paths.removeLast();
+        }
+    }
+    QString fname = QFileDialog::getOpenFileName(this, tr(caption),
+        dir, tr("AmbDec Files (*.ambdec);;All Files (*.*)")
+    );
+    if(!fname.isEmpty())
+    {
+        line->setText(fname);
+        enableApplyButton();
+    }
+}
+
+
 void MainWindow::updateJackBufferSizeEdit(int size)
 {
     ui->jackBufferSizeLine->clear();
@@ -1156,7 +1238,9 @@ void MainWindow::showDisabledBackendMenu(QPoint pt)
 
 void MainWindow::selectOSSPlayback()
 {
-    QString fname = QFileDialog::getOpenFileName(this, tr("Select Playback Device"));
+    QString current = ui->ossDefaultDeviceLine->text();
+    if(current.isEmpty()) current = ui->ossDefaultDeviceLine->placeholderText();
+    QString fname = QFileDialog::getOpenFileName(this, tr("Select Playback Device"), current);
     if(!fname.isEmpty())
     {
         ui->ossDefaultDeviceLine->setText(fname);
@@ -1166,7 +1250,9 @@ void MainWindow::selectOSSPlayback()
 
 void MainWindow::selectOSSCapture()
 {
-    QString fname = QFileDialog::getOpenFileName(this, tr("Select Capture Device"));
+    QString current = ui->ossDefaultCaptureLine->text();
+    if(current.isEmpty()) current = ui->ossDefaultCaptureLine->placeholderText();
+    QString fname = QFileDialog::getOpenFileName(this, tr("Select Capture Device"), current);
     if(!fname.isEmpty())
     {
         ui->ossDefaultCaptureLine->setText(fname);
@@ -1176,7 +1262,9 @@ void MainWindow::selectOSSCapture()
 
 void MainWindow::selectSolarisPlayback()
 {
-    QString fname = QFileDialog::getOpenFileName(this, tr("Select Playback Device"));
+    QString current = ui->solarisDefaultDeviceLine->text();
+    if(current.isEmpty()) current = ui->solarisDefaultDeviceLine->placeholderText();
+    QString fname = QFileDialog::getOpenFileName(this, tr("Select Playback Device"), current);
     if(!fname.isEmpty())
     {
         ui->solarisDefaultDeviceLine->setText(fname);

@@ -36,6 +36,8 @@
 #include "uintmap.h"
 #include "vector.h"
 #include "alstring.h"
+#include "almalloc.h"
+#include "threads.h"
 
 #include "hrtf.h"
 
@@ -47,6 +49,79 @@ typedef uint64_t ALCuint64SOFT;
 typedef void (ALC_APIENTRY*LPALCGETINTEGER64VSOFT)(ALCdevice *device, ALCenum pname, ALsizei size, ALCint64SOFT *values);
 #ifdef AL_ALEXT_PROTOTYPES
 ALC_API void ALC_APIENTRY alcGetInteger64vSOFT(ALCdevice *device, ALCenum pname, ALsizei size, ALCint64SOFT *values);
+#endif
+#endif
+
+#ifndef AL_SOFT_buffer_samples2
+#define AL_SOFT_buffer_samples2 1
+/* Channel configurations */
+#define AL_MONO_SOFT                             0x1500
+#define AL_STEREO_SOFT                           0x1501
+#define AL_REAR_SOFT                             0x1502
+#define AL_QUAD_SOFT                             0x1503
+#define AL_5POINT1_SOFT                          0x1504
+#define AL_6POINT1_SOFT                          0x1505
+#define AL_7POINT1_SOFT                          0x1506
+#define AL_BFORMAT2D_SOFT                        0x1507
+#define AL_BFORMAT3D_SOFT                        0x1508
+
+/* Sample types */
+#define AL_BYTE_SOFT                             0x1400
+#define AL_UNSIGNED_BYTE_SOFT                    0x1401
+#define AL_SHORT_SOFT                            0x1402
+#define AL_UNSIGNED_SHORT_SOFT                   0x1403
+#define AL_INT_SOFT                              0x1404
+#define AL_UNSIGNED_INT_SOFT                     0x1405
+#define AL_FLOAT_SOFT                            0x1406
+#define AL_DOUBLE_SOFT                           0x1407
+#define AL_BYTE3_SOFT                            0x1408
+#define AL_UNSIGNED_BYTE3_SOFT                   0x1409
+#define AL_MULAW_SOFT                            0x140A
+
+/* Storage formats */
+#define AL_MONO8_SOFT                            0x1100
+#define AL_MONO16_SOFT                           0x1101
+#define AL_MONO32F_SOFT                          0x10010
+#define AL_STEREO8_SOFT                          0x1102
+#define AL_STEREO16_SOFT                         0x1103
+#define AL_STEREO32F_SOFT                        0x10011
+#define AL_QUAD8_SOFT                            0x1204
+#define AL_QUAD16_SOFT                           0x1205
+#define AL_QUAD32F_SOFT                          0x1206
+#define AL_REAR8_SOFT                            0x1207
+#define AL_REAR16_SOFT                           0x1208
+#define AL_REAR32F_SOFT                          0x1209
+#define AL_5POINT1_8_SOFT                        0x120A
+#define AL_5POINT1_16_SOFT                       0x120B
+#define AL_5POINT1_32F_SOFT                      0x120C
+#define AL_6POINT1_8_SOFT                        0x120D
+#define AL_6POINT1_16_SOFT                       0x120E
+#define AL_6POINT1_32F_SOFT                      0x120F
+#define AL_7POINT1_8_SOFT                        0x1210
+#define AL_7POINT1_16_SOFT                       0x1211
+#define AL_7POINT1_32F_SOFT                      0x1212
+#define AL_BFORMAT2D_8_SOFT                      0x20021
+#define AL_BFORMAT2D_16_SOFT                     0x20022
+#define AL_BFORMAT2D_32F_SOFT                    0x20023
+#define AL_BFORMAT3D_8_SOFT                      0x20031
+#define AL_BFORMAT3D_16_SOFT                     0x20032
+#define AL_BFORMAT3D_32F_SOFT                    0x20033
+
+/* Buffer attributes */
+#define AL_INTERNAL_FORMAT_SOFT                  0x2008
+#define AL_BYTE_LENGTH_SOFT                      0x2009
+#define AL_SAMPLE_LENGTH_SOFT                    0x200A
+#define AL_SEC_LENGTH_SOFT                       0x200B
+
+#if 0
+typedef void (AL_APIENTRY*LPALBUFFERSAMPLESSOFT)(ALuint,ALuint,ALenum,ALsizei,ALenum,ALenum,const ALvoid*);
+typedef void (AL_APIENTRY*LPALGETBUFFERSAMPLESSOFT)(ALuint,ALsizei,ALsizei,ALenum,ALenum,ALvoid*);
+typedef ALboolean (AL_APIENTRY*LPALISBUFFERFORMATSUPPORTEDSOFT)(ALenum);
+#ifdef AL_ALEXT_PROTOTYPES
+AL_API void AL_APIENTRY alBufferSamplesSOFT(ALuint buffer, ALuint samplerate, ALenum internalformat, ALsizei samples, ALenum channels, ALenum type, const ALvoid *data);
+AL_API void AL_APIENTRY alGetBufferSamplesSOFT(ALuint buffer, ALsizei offset, ALsizei samples, ALenum channels, ALenum type, ALvoid *data);
+AL_API ALboolean AL_APIENTRY alIsBufferFormatSupportedSOFT(ALenum format);
+#endif
 #endif
 #endif
 
@@ -326,10 +401,22 @@ enum Channel {
     LowerBackLeft,
     LowerBackRight,
 
-    BFormatW,
-    BFormatX,
-    BFormatY,
-    BFormatZ,
+    Aux0,
+    Aux1,
+    Aux2,
+    Aux3,
+    Aux4,
+    Aux5,
+    Aux6,
+    Aux7,
+    Aux8,
+    Aux9,
+    Aux10,
+    Aux11,
+    Aux12,
+    Aux13,
+    Aux14,
+    Aux15,
 
     InvalidChannel
 };
@@ -362,7 +449,7 @@ enum DevFmtChannels {
 
     DevFmtChannelsDefault = DevFmtStereo
 };
-#define MAX_OUTPUT_CHANNELS  (8)
+#define MAX_OUTPUT_CHANNELS  (16)
 
 ALuint BytesFromDevFmt(enum DevFmtType type) DECL_CONST;
 ALuint ChannelsFromDevFmt(enum DevFmtChannels chans) DECL_CONST;
@@ -397,9 +484,14 @@ enum RenderMode {
 /* The maximum number of Ambisonics coefficients. For a given order (o), the
  * size needed will be (o+1)**2, thus zero-order has 1, first-order has 4,
  * second-order has 9, and third-order has 16. */
-#define MAX_AMBI_COEFFS 16
+#define MAX_AMBI_ORDER  3
+#define MAX_AMBI_COEFFS ((MAX_AMBI_ORDER+1) * (MAX_AMBI_ORDER+1))
 
 typedef ALfloat ChannelConfig[MAX_AMBI_COEFFS];
+typedef struct BFChannelConfig {
+    ALfloat Scale;
+    ALuint Index;
+} BFChannelConfig;
 
 
 #define HRTF_HISTORY_BITS   (6)
@@ -431,25 +523,25 @@ struct ALCdevice_struct
     ALCboolean Connected;
     enum DeviceType Type;
 
-    ALuint       Frequency;
-    ALuint       UpdateSize;
-    ALuint       NumUpdates;
+    ALuint Frequency;
+    ALuint UpdateSize;
+    ALuint NumUpdates;
     enum DevFmtChannels FmtChans;
     enum DevFmtType     FmtType;
-    ALboolean    IsHeadphones;
+    ALboolean IsHeadphones;
 
     al_string DeviceName;
 
     ATOMIC(ALCenum) LastError;
 
     // Maximum number of sources that can be created
-    ALuint       MaxNoOfSources;
+    ALuint MaxNoOfSources;
     // Maximum number of slots that can be created
-    ALuint       AuxiliaryEffectSlotMax;
+    ALuint AuxiliaryEffectSlotMax;
 
-    ALCuint      NumMonoSources;
-    ALCuint      NumStereoSources;
-    ALuint       NumAuxSends;
+    ALCuint NumMonoSources;
+    ALCuint NumStereoSources;
+    ALuint  NumAuxSends;
 
     // Map of Buffers for this device
     UIntMap BufferMap;
@@ -465,12 +557,17 @@ struct ALCdevice_struct
     al_string Hrtf_Name;
     const struct Hrtf *Hrtf;
     ALCenum Hrtf_Status;
+
+    /* HRTF filter state for dry buffer content */
     HrtfState Hrtf_State[MAX_OUTPUT_CHANNELS];
     HrtfParams Hrtf_Params[MAX_OUTPUT_CHANNELS];
     ALuint Hrtf_Offset;
 
     /* UHJ encoder state */
     struct Uhj2Encoder *Uhj_Encoder;
+
+    /* High quality Ambisonic decoder */
+    struct BFormatDec *AmbiDecoder;
 
     // Stereo-to-binaural filter
     struct bs2b *Bs2b;
@@ -481,11 +578,6 @@ struct ALCdevice_struct
     // Device flags
     ALuint Flags;
 
-    enum Channel ChannelName[MAX_OUTPUT_CHANNELS];
-    ChannelConfig AmbiCoeffs[MAX_OUTPUT_CHANNELS];
-    ALfloat AmbiScale; /* Scale for first-order XYZ inputs using AmbCoeffs. */
-    ALuint NumChannels;
-
     ALuint64 ClockBase;
     ALuint SamplesDone;
 
@@ -494,8 +586,51 @@ struct ALCdevice_struct
     alignas(16) ALfloat ResampledData[BUFFERSIZE];
     alignas(16) ALfloat FilteredData[BUFFERSIZE];
 
-    /* Dry path buffer mix. */
-    alignas(16) ALfloat (*DryBuffer)[BUFFERSIZE];
+    /* The "dry" path corresponds to the main output. */
+    struct {
+        union {
+            /* Ambisonic coefficients for mixing to the dry buffer. */
+            ChannelConfig Coeffs[MAX_OUTPUT_CHANNELS];
+            /* Coefficient channel mapping for mixing to the dry buffer. */
+            BFChannelConfig Map[MAX_OUTPUT_CHANNELS];
+        } Ambi;
+        /* Number of coefficients in each ChannelConfig to mix together (4 for
+         * first-order, 9 for second-order, etc). If the count is 0, the
+         * BFChannelConfig is used instead to map each output to a coefficient
+         * index.
+         */
+        ALuint CoeffCount;
+
+        /* Dry buffer will be aliased by the virtual or real output. */
+        ALfloat (*Buffer)[BUFFERSIZE];
+        ALuint NumChannels;
+    } Dry;
+
+    /* First-order ambisonics output, to be upsampled to the dry buffer if different. */
+    struct {
+        union {
+            ChannelConfig Coeffs[MAX_OUTPUT_CHANNELS];
+            BFChannelConfig Map[MAX_OUTPUT_CHANNELS];
+        } Ambi;
+        /* Will only be 4 or 0. */
+        ALuint CoeffCount;
+
+        ALfloat (*Buffer)[BUFFERSIZE];
+        ALuint NumChannels;
+    } FOAOut;
+
+    /* Virtual output, to be post-processed to the real output. */
+    struct {
+        ALfloat (*Buffer)[BUFFERSIZE];
+        ALuint NumChannels;
+    } VirtOut;
+    /* "Real" output, which will be written to the device buffer. */
+    struct {
+        enum Channel ChannelName[MAX_OUTPUT_CHANNELS];
+
+        ALfloat (*Buffer)[BUFFERSIZE];
+        ALuint NumChannels;
+    } RealOut;
 
     /* Running count of the mixer invocations, in 31.1 fixed point. This
      * actually increments *twice* when mixing, first at the start and then at
@@ -510,6 +645,7 @@ struct ALCdevice_struct
     // Contexts created on this device
     ATOMIC(ALCcontext*) ContextList;
 
+    almtx_t BackendLock;
     struct ALCbackend *Backend;
 
     void *ExtraData; // For the backend's use
@@ -545,8 +681,7 @@ struct ALCdevice_struct
 #define RECORD_THREAD_NAME "alsoft-record"
 
 
-struct ALCcontext_struct
-{
+struct ALCcontext_struct {
     RefCount ref;
 
     struct ALlistener *Listener;
@@ -556,21 +691,27 @@ struct ALCcontext_struct
 
     ATOMIC(ALenum) LastError;
 
-    ATOMIC(ALenum) UpdateSources;
-
     volatile enum DistanceModel DistanceModel;
     volatile ALboolean SourceDistanceModel;
 
     volatile ALfloat DopplerFactor;
     volatile ALfloat DopplerVelocity;
     volatile ALfloat SpeedOfSound;
-    volatile ALenum  DeferUpdates;
+    ATOMIC(ALenum) DeferUpdates;
+
+    RWLock PropLock;
+
+    /* Counter for the pre-mixing updates, in 31.1 fixed point (lowest bit
+     * indicates if updates are currently happening).
+     */
+    RefCount UpdateCount;
+    ATOMIC(ALenum) HoldUpdates;
 
     struct ALvoice *Voices;
     ALsizei VoiceCount;
     ALsizei MaxVoices;
 
-    VECTOR(struct ALeffectslot*) ActiveAuxSlots;
+    ATOMIC(struct ALeffectslot*) ActiveAuxSlotList;
 
     ALCdevice  *Device;
     const ALCchar *ExtensionList;
@@ -602,11 +743,6 @@ inline void UnlockContext(ALCcontext *context)
 { ALCdevice_Unlock(context->Device); }
 
 
-void *al_malloc(size_t alignment, size_t size);
-void *al_calloc(size_t alignment, size_t size);
-void al_free(void *ptr);
-
-
 typedef struct {
 #ifdef HAVE_FENV_H
     DERIVE_FROM_TYPE(fenv_t);
@@ -620,13 +756,6 @@ typedef struct {
 void SetMixerFPUMode(FPUCtl *ctl);
 void RestoreFPUMode(const FPUCtl *ctl);
 
-
-typedef struct RingBuffer RingBuffer;
-RingBuffer *CreateRingBuffer(ALsizei frame_size, ALsizei length);
-void DestroyRingBuffer(RingBuffer *ring);
-ALsizei RingBufferSize(RingBuffer *ring);
-void WriteRingBuffer(RingBuffer *ring, const ALubyte *data, ALsizei len);
-void ReadRingBuffer(RingBuffer *ring, ALubyte *data, ALsizei len);
 
 typedef struct ll_ringbuffer ll_ringbuffer_t;
 typedef struct ll_ringbuffer_data {
@@ -669,20 +798,20 @@ const ALCchar *DevFmtChannelsString(enum DevFmtChannels chans) DECL_CONST;
 /**
  * GetChannelIdxByName
  *
- * Returns the device's channel index given a channel name (e.g. FrontCenter),
- * or -1 if it doesn't exist.
+ * Returns the index for the given channel name (e.g. FrontCenter), or -1 if it
+ * doesn't exist.
  */
-inline ALint GetChannelIdxByName(const ALCdevice *device, enum Channel chan)
+inline ALint GetChannelIndex(const enum Channel names[MAX_OUTPUT_CHANNELS], enum Channel chan)
 {
-    ALint i = 0;
+    ALint i;
     for(i = 0;i < MAX_OUTPUT_CHANNELS;i++)
     {
-        if(device->ChannelName[i] == chan)
+        if(names[i] == chan)
             return i;
     }
     return -1;
 }
-
+#define GetChannelIdxByName(x, c) GetChannelIndex((x).ChannelName, (c))
 
 extern FILE *LogFile;
 

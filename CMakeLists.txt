@@ -45,11 +45,10 @@ OPTION(ALSOFT_TESTS     "Build and install test programs"     OFF)
 
 OPTION(ALSOFT_CONFIG "Install alsoft.conf sample configuration file" OFF)
 OPTION(ALSOFT_HRTF_DEFS "Install HRTF definition files" OFF)
+OPTION(ALSOFT_AMBDEC_PRESETS "Install AmbDec preset files" OFF)
 OPTION(ALSOFT_INSTALL "Install headers and libraries" OFF)
 
-
 set(SHARE_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share" CACHE STRING "The share install dir")
-
 
 IF(NOT WIN32)
     SET(LIBNAME openal)
@@ -612,7 +611,8 @@ IF(NOT HAVE_STDINT_H)
 ENDIF()
 
 
-SET(COMMON_OBJS  common/atomic.c
+SET(COMMON_OBJS  common/almalloc.c
+                 common/atomic.c
                  common/rwlock.c
                  common/threads.c
                  common/uintmap.c
@@ -649,6 +649,8 @@ SET(ALC_OBJS  Alc/ALc.c
               Alc/bsinc.c
               Alc/hrtf.c
               Alc/uhjfilter.c
+              Alc/ambdec.c
+              Alc/bformatdec.c
               Alc/panning.c
               Alc/mixer.c
               Alc/mixer_c.c
@@ -1230,6 +1232,20 @@ IF(ALSOFT_HRTF_DEFS)
     INSTALL(FILES hrtf/default-44100.mhr
                   hrtf/default-48000.mhr
             DESTINATION ${SHARE_INSTALL_DIR}/openal/hrtf
+    )
+    MESSAGE(STATUS "Installing HRTF definitions")
+    MESSAGE(STATUS "")
+ENDIF()
+
+# Install AmbDec presets
+IF(ALSOFT_AMBDEC_PRESETS)
+    INSTALL(FILES presets/3D7.1.ambdec
+                  presets/hexagon.ambdec
+                  presets/itu5.1.ambdec
+                  presets/rectangle.ambdec
+                  presets/square.ambdec
+                  presets/presets.txt
+            DESTINATION ${SHARE_INSTALL_DIR}/openal/presets
     )
     MESSAGE(STATUS "Installing HRTF definitions")
     MESSAGE(STATUS "")

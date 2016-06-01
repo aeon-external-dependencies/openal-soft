@@ -37,15 +37,21 @@
 #include "backends/base.h"
 
 #include "threads.h"
+#include "almalloc.h"
 
 
+extern inline void LockSourcesRead(ALCcontext *context);
+extern inline void UnlockSourcesRead(ALCcontext *context);
+extern inline void LockSourcesWrite(ALCcontext *context);
+extern inline void UnlockSourcesWrite(ALCcontext *context);
 extern inline struct ALsource *LookupSource(ALCcontext *context, ALuint id);
 extern inline struct ALsource *RemoveSource(ALCcontext *context, ALuint id);
 
 static ALvoid InitSourceParams(ALsource *Source);
-static ALint64 GetSourceSampleOffset(ALsource *Source);
-static ALdouble GetSourceSecOffset(ALsource *Source);
-static ALvoid GetSourceOffsets(ALsource *Source, ALenum name, ALdouble *offsets, ALdouble updateLen);
+static ALvoid DeinitSource(ALsource *source);
+static ALint64 GetSourceSampleOffset(ALsource *Source, ALCdevice *device, ALuint64 *clocktime);
+static ALdouble GetSourceSecOffset(ALsource *Source, ALCdevice *device, ALuint64 *clocktime);
+static ALdouble GetSourceOffset(ALsource *Source, ALenum name, ALCdevice *device);
 static ALboolean GetSampleOffset(ALsource *Source, ALuint *offset, ALuint *frac);
 
 typedef enum SourceProp {
@@ -96,13 +102,15 @@ typedef enum SourceProp {
     srcSampleLengthSOFT = AL_SAMPLE_LENGTH_SOFT,
     srcSecLengthSOFT = AL_SEC_LENGTH_SOFT,
 
-    /* AL_SOFT_buffer_sub_data / AL_SOFT_buffer_samples */
-    srcSampleRWOffsetsSOFT = AL_SAMPLE_RW_OFFSETS_SOFT,
-    srcByteRWOffsetsSOFT = AL_BYTE_RW_OFFSETS_SOFT,
-
     /* AL_SOFT_source_latency */
     srcSampleOffsetLatencySOFT = AL_SAMPLE_OFFSET_LATENCY_SOFT,
     srcSecOffsetLatencySOFT = AL_SEC_OFFSET_LATENCY_SOFT,
+
+    /* AL_EXT_STEREO_ANGLES */
+    srcAngles = AL_STEREO_ANGLES,
+
+    /* AL_EXT_SOURCE_RADIUS */
+    srcRadius = AL_SOURCE_RADIUS,
 
     /* AL_EXT_BFORMAT */
     srcOrientation = AL_ORIENTATION,
@@ -115,6 +123,12 @@ static ALboolean SetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
 static ALboolean GetSourcedv(ALsource *Source, ALCcontext *Context, SourceProp prop, ALdouble *values);
 static ALboolean GetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp prop, ALint *values);
 static ALboolean GetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp prop, ALint64 *values);
+
+static inline bool SourceShouldUpdate(const ALsource *source, const ALCcontext *context)
+{
+    return (source->state == AL_PLAYING || source->state == AL_PAUSED) &&
+           !ATOMIC_LOAD(&context->DeferUpdates, almemory_order_acquire);
+}
 
 static ALint FloatValsByProp(ALenum prop)
 {
@@ -153,10 +167,10 @@ static ALint FloatValsByProp(ALenum prop)
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             return 1;
 
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
+        case AL_STEREO_ANGLES:
             return 2;
 
         case AL_POSITION:
@@ -216,11 +230,11 @@ static ALint DoubleValsByProp(ALenum prop)
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             return 1;
 
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
         case AL_SEC_OFFSET_LATENCY_SOFT:
+        case AL_STEREO_ANGLES:
             return 2;
 
         case AL_POSITION:
@@ -280,11 +294,8 @@ static ALint IntValsByProp(ALenum prop)
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             return 1;
-
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
-            return 2;
 
         case AL_POSITION:
         case AL_VELOCITY:
@@ -299,6 +310,8 @@ static ALint IntValsByProp(ALenum prop)
             break; /* i64 only */
         case AL_SEC_OFFSET_LATENCY_SOFT:
             break; /* Double only */
+        case AL_STEREO_ANGLES:
+            break; /* Float/double only */
     }
     return 0;
 }
@@ -341,10 +354,9 @@ static ALint Int64ValsByProp(ALenum prop)
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             return 1;
 
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
         case AL_SAMPLE_OFFSET_LATENCY_SOFT:
             return 2;
 
@@ -359,6 +371,8 @@ static ALint Int64ValsByProp(ALenum prop)
 
         case AL_SEC_OFFSET_LATENCY_SOFT:
             break; /* Double only */
+        case AL_STEREO_ANGLES:
+            break; /* Float/double only */
     }
     return 0;
 }
@@ -369,14 +383,18 @@ static ALint Int64ValsByProp(ALenum prop)
         SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);      \
 } while(0)
 
+#define DO_UPDATEPROPS() do {                                                 \
+    if(SourceShouldUpdate(Source, Context))                                   \
+        UpdateSourceProps(Source, device->NumAuxSends, Context);              \
+} while(0)
+
 static ALboolean SetSourcefv(ALsource *Source, ALCcontext *Context, SourceProp prop, const ALfloat *values)
 {
+    ALCdevice *device = Context->Device;
     ALint ival;
 
     switch(prop)
     {
-        case AL_BYTE_RW_OFFSETS_SOFT:
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
@@ -388,98 +406,98 @@ static ALboolean SetSourcefv(ALsource *Source, ALCcontext *Context, SourceProp p
             CHECKVAL(*values >= 0.0f);
 
             Source->Pitch = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_CONE_INNER_ANGLE:
             CHECKVAL(*values >= 0.0f && *values <= 360.0f);
 
             Source->InnerAngle = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_CONE_OUTER_ANGLE:
             CHECKVAL(*values >= 0.0f && *values <= 360.0f);
 
             Source->OuterAngle = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_GAIN:
             CHECKVAL(*values >= 0.0f);
 
             Source->Gain = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_MAX_DISTANCE:
             CHECKVAL(*values >= 0.0f);
 
             Source->MaxDistance = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_ROLLOFF_FACTOR:
             CHECKVAL(*values >= 0.0f);
 
             Source->RollOffFactor = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_REFERENCE_DISTANCE:
             CHECKVAL(*values >= 0.0f);
 
             Source->RefDistance = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_MIN_GAIN:
             CHECKVAL(*values >= 0.0f && *values <= 1.0f);
 
             Source->MinGain = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_MAX_GAIN:
             CHECKVAL(*values >= 0.0f && *values <= 1.0f);
 
             Source->MaxGain = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_CONE_OUTER_GAIN:
             CHECKVAL(*values >= 0.0f && *values <= 1.0f);
 
             Source->OuterGain = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_CONE_OUTER_GAINHF:
             CHECKVAL(*values >= 0.0f && *values <= 1.0f);
 
             Source->OuterGainHF = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_AIR_ABSORPTION_FACTOR:
             CHECKVAL(*values >= 0.0f && *values <= 10.0f);
 
             Source->AirAbsorptionFactor = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_ROOM_ROLLOFF_FACTOR:
             CHECKVAL(*values >= 0.0f && *values <= 10.0f);
 
             Source->RoomRolloffFactor = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_DOPPLER_FACTOR:
             CHECKVAL(*values >= 0.0f && *values <= 1.0f);
 
             Source->DopplerFactor = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_SEC_OFFSET:
@@ -487,13 +505,13 @@ static ALboolean SetSourcefv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_BYTE_OFFSET:
             CHECKVAL(*values >= 0.0f);
 
-            LockContext(Context);
             Source->OffsetType = prop;
             Source->Offset = *values;
 
             if((Source->state == AL_PLAYING || Source->state == AL_PAUSED) &&
-               !Context->DeferUpdates)
+               !ATOMIC_LOAD(&Context->DeferUpdates, almemory_order_acquire))
             {
+                LockContext(Context);
                 WriteLock(&Source->queue_lock);
                 if(ApplyOffset(Source) == AL_FALSE)
                 {
@@ -502,51 +520,64 @@ static ALboolean SetSourcefv(ALsource *Source, ALCcontext *Context, SourceProp p
                     SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);
                 }
                 WriteUnlock(&Source->queue_lock);
+                UnlockContext(Context);
             }
-            UnlockContext(Context);
+            return AL_TRUE;
+
+        case AL_SOURCE_RADIUS:
+            CHECKVAL(*values >= 0.0f && isfinite(*values));
+
+            Source->Radius = *values;
+            DO_UPDATEPROPS();
+            return AL_TRUE;
+
+        case AL_STEREO_ANGLES:
+            CHECKVAL(isfinite(values[0]) && isfinite(values[1]));
+
+            Source->StereoPan[0] = values[0];
+            Source->StereoPan[1] = values[1];
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
 
         case AL_POSITION:
             CHECKVAL(isfinite(values[0]) && isfinite(values[1]) && isfinite(values[2]));
 
-            LockContext(Context);
-            aluVectorSet(&Source->Position, values[0], values[1], values[2], 1.0f);
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            Source->Position[0] = values[0];
+            Source->Position[1] = values[1];
+            Source->Position[2] = values[2];
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_VELOCITY:
             CHECKVAL(isfinite(values[0]) && isfinite(values[1]) && isfinite(values[2]));
 
-            LockContext(Context);
-            aluVectorSet(&Source->Velocity, values[0], values[1], values[2], 0.0f);
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            Source->Velocity[0] = values[0];
+            Source->Velocity[1] = values[1];
+            Source->Velocity[2] = values[2];
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_DIRECTION:
             CHECKVAL(isfinite(values[0]) && isfinite(values[1]) && isfinite(values[2]));
 
-            LockContext(Context);
-            aluVectorSet(&Source->Direction, values[0], values[1], values[2], 0.0f);
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            Source->Direction[0] = values[0];
+            Source->Direction[1] = values[1];
+            Source->Direction[2] = values[2];
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_ORIENTATION:
             CHECKVAL(isfinite(values[0]) && isfinite(values[1]) && isfinite(values[2]) &&
                      isfinite(values[3]) && isfinite(values[4]) && isfinite(values[5]));
 
-            LockContext(Context);
             Source->Orientation[0][0] = values[0];
             Source->Orientation[0][1] = values[1];
             Source->Orientation[0][2] = values[2];
             Source->Orientation[1][0] = values[3];
             Source->Orientation[1][1] = values[4];
             Source->Orientation[1][2] = values[5];
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
 
@@ -594,8 +625,6 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_SOURCE_TYPE:
         case AL_BUFFERS_QUEUED:
         case AL_BUFFERS_PROCESSED:
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
         case AL_SEC_LENGTH_SOFT:
@@ -606,22 +635,29 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->HeadRelative = (ALboolean)*values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_LOOPING:
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->Looping = (ALboolean)*values;
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_BUFFER:
-            CHECKVAL(*values == 0 || (buffer=LookupBuffer(device, *values)) != NULL);
+            LockBuffersRead(device);
+            if(!(*values == 0 || (buffer=LookupBuffer(device, *values)) != NULL))
+            {
+                UnlockBuffersRead(device);
+                SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);
+            }
 
             WriteLock(&Source->queue_lock);
             if(!(Source->state == AL_STOPPED || Source->state == AL_INITIAL))
             {
                 WriteUnlock(&Source->queue_lock);
+                UnlockBuffersRead(device);
                 SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_OPERATION, AL_FALSE);
             }
 
@@ -650,6 +686,7 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
             oldlist = ATOMIC_EXCHANGE(ALbufferlistitem*, &Source->queue, newlist);
             ATOMIC_STORE(&Source->current_buffer, newlist);
             WriteUnlock(&Source->queue_lock);
+            UnlockBuffersRead(device);
 
             /* Delete all elements in the previous queue */
             while(oldlist != NULL)
@@ -668,13 +705,13 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_BYTE_OFFSET:
             CHECKVAL(*values >= 0);
 
-            LockContext(Context);
             Source->OffsetType = prop;
             Source->Offset = *values;
 
             if((Source->state == AL_PLAYING || Source->state == AL_PAUSED) &&
-                !Context->DeferUpdates)
+                !ATOMIC_LOAD(&Context->DeferUpdates, almemory_order_acquire))
             {
+                LockContext(Context);
                 WriteLock(&Source->queue_lock);
                 if(ApplyOffset(Source) == AL_FALSE)
                 {
@@ -683,14 +720,18 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
                     SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);
                 }
                 WriteUnlock(&Source->queue_lock);
+                UnlockContext(Context);
             }
-            UnlockContext(Context);
             return AL_TRUE;
 
         case AL_DIRECT_FILTER:
-            CHECKVAL(*values == 0 || (filter=LookupFilter(device, *values)) != NULL);
+            LockFiltersRead(device);
+            if(!(*values == 0 || (filter=LookupFilter(device, *values)) != NULL))
+            {
+                UnlockFiltersRead(device);
+                SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);
+            }
 
-            LockContext(Context);
             if(!filter)
             {
                 Source->Direct.Gain = 1.0f;
@@ -707,36 +748,36 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
                 Source->Direct.GainLF = filter->GainLF;
                 Source->Direct.LFReference = filter->LFReference;
             }
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            UnlockFiltersRead(device);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_DIRECT_FILTER_GAINHF_AUTO:
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->DryGainHFAuto = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_AUXILIARY_SEND_FILTER_GAIN_AUTO:
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->WetGainAuto = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_AUXILIARY_SEND_FILTER_GAINHF_AUTO:
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->WetGainHFAuto = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_DIRECT_CHANNELS_SOFT:
             CHECKVAL(*values == AL_FALSE || *values == AL_TRUE);
 
             Source->DirectChannels = *values;
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            DO_UPDATEPROPS();
             return AL_TRUE;
 
         case AL_DISTANCE_MODEL:
@@ -750,24 +791,21 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
 
             Source->DistanceModel = *values;
             if(Context->SourceDistanceModel)
-                ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+                DO_UPDATEPROPS();
             return AL_TRUE;
 
 
         case AL_AUXILIARY_SEND_FILTER:
-            LockContext(Context);
+            LockEffectSlotsRead(Context);
+            LockFiltersRead(device);
             if(!((ALuint)values[1] < device->NumAuxSends &&
                  (values[0] == 0 || (slot=LookupEffectSlot(Context, values[0])) != NULL) &&
                  (values[2] == 0 || (filter=LookupFilter(device, values[2])) != NULL)))
             {
-                UnlockContext(Context);
+                UnlockFiltersRead(device);
+                UnlockEffectSlotsRead(Context);
                 SET_ERROR_AND_RETURN_VALUE(Context, AL_INVALID_VALUE, AL_FALSE);
             }
-
-            /* Add refcount on the new slot, and release the previous slot */
-            if(slot) IncrementRef(&slot->ref);
-            slot = ExchangePtr((XchgPtr*)&Source->Send[values[1]].Slot, slot);
-            if(slot) DecrementRef(&slot->ref);
 
             if(!filter)
             {
@@ -786,8 +824,32 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
                 Source->Send[values[1]].GainLF = filter->GainLF;
                 Source->Send[values[1]].LFReference = filter->LFReference;
             }
-            UnlockContext(Context);
-            ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+            UnlockFiltersRead(device);
+
+            if(slot != Source->Send[values[1]].Slot &&
+               (Source->state == AL_PLAYING || Source->state == AL_PAUSED))
+            {
+                /* Add refcount on the new slot, and release the previous slot */
+                if(slot) IncrementRef(&slot->ref);
+                if(Source->Send[values[1]].Slot)
+                    DecrementRef(&Source->Send[values[1]].Slot->ref);
+                Source->Send[values[1]].Slot = slot;
+
+                /* We must force an update if the auxiliary slot changed on a
+                 * playing source, in case the slot is about to be deleted.
+                 */
+                UpdateSourceProps(Source, device->NumAuxSends, Context);
+            }
+            else
+            {
+                if(slot) IncrementRef(&slot->ref);
+                if(Source->Send[values[1]].Slot)
+                    DecrementRef(&Source->Send[values[1]].Slot->ref);
+                Source->Send[values[1]].Slot = slot;
+                DO_UPDATEPROPS();
+            }
+            UnlockEffectSlotsRead(Context);
+
             return AL_TRUE;
 
 
@@ -806,6 +868,7 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_CONE_OUTER_GAINHF:
         case AL_AIR_ABSORPTION_FACTOR:
         case AL_ROOM_ROLLOFF_FACTOR:
+        case AL_SOURCE_RADIUS:
             fvals[0] = (ALfloat)*values;
             return SetSourcefv(Source, Context, (int)prop, fvals);
 
@@ -830,6 +893,7 @@ static ALboolean SetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
 
         case AL_SAMPLE_OFFSET_LATENCY_SOFT:
         case AL_SEC_OFFSET_LATENCY_SOFT:
+        case AL_STEREO_ANGLES:
             break;
     }
 
@@ -848,8 +912,6 @@ static ALboolean SetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
         case AL_BUFFERS_QUEUED:
         case AL_BUFFERS_PROCESSED:
         case AL_SOURCE_STATE:
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
         case AL_SAMPLE_OFFSET_LATENCY_SOFT:
         case AL_BYTE_LENGTH_SOFT:
         case AL_SAMPLE_LENGTH_SOFT:
@@ -908,6 +970,7 @@ static ALboolean SetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
         case AL_CONE_OUTER_GAINHF:
         case AL_AIR_ABSORPTION_FACTOR:
         case AL_ROOM_ROLLOFF_FACTOR:
+        case AL_SOURCE_RADIUS:
             fvals[0] = (ALfloat)*values;
             return SetSourcefv(Source, Context, (int)prop, fvals);
 
@@ -931,6 +994,7 @@ static ALboolean SetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
             return SetSourcefv(Source, Context, (int)prop, fvals);
 
         case AL_SEC_OFFSET_LATENCY_SOFT:
+        case AL_STEREO_ANGLES:
             break;
     }
 
@@ -945,8 +1009,8 @@ static ALboolean GetSourcedv(ALsource *Source, ALCcontext *Context, SourceProp p
 {
     ALCdevice *device = Context->Device;
     ALbufferlistitem *BufferList;
-    ALdouble offsets[2];
-    ALdouble updateLen;
+    ClockLatency clocktime;
+    ALuint64 srcclock;
     ALint ivals[3];
     ALboolean err;
 
@@ -995,10 +1059,7 @@ static ALboolean GetSourcedv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_SEC_OFFSET:
         case AL_SAMPLE_OFFSET:
         case AL_BYTE_OFFSET:
-            LockContext(Context);
-            GetSourceOffsets(Source, prop, offsets, 0.0);
-            UnlockContext(Context);
-            *values = offsets[0];
+            *values = GetSourceOffset(Source, prop, device);
             return AL_TRUE;
 
         case AL_CONE_OUTER_GAINHF:
@@ -1038,55 +1099,60 @@ static ALboolean GetSourcedv(ALsource *Source, ALCcontext *Context, SourceProp p
             ReadUnlock(&Source->queue_lock);
             return AL_TRUE;
 
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
-            LockContext(Context);
-            updateLen = (ALdouble)device->UpdateSize / device->Frequency;
-            GetSourceOffsets(Source, prop, values, updateLen);
-            UnlockContext(Context);
+        case AL_SOURCE_RADIUS:
+            *values = Source->Radius;
+            return AL_TRUE;
+
+        case AL_STEREO_ANGLES:
+            values[0] = Source->StereoPan[0];
+            values[1] = Source->StereoPan[1];
             return AL_TRUE;
 
         case AL_SEC_OFFSET_LATENCY_SOFT:
-            LockContext(Context);
-            values[0] = GetSourceSecOffset(Source);
-            values[1] = (ALdouble)(V0(device->Backend,getLatency)()) /
-                        1000000000.0;
-            UnlockContext(Context);
+            /* Get the source offset with the clock time first. Then get the
+             * clock time with the device latency. Order is important.
+             */
+            values[0] = GetSourceSecOffset(Source, device, &srcclock);
+            clocktime = V0(device->Backend,getClockLatency)();
+            if(srcclock == (ALuint64)clocktime.ClockTime)
+                values[1] = (ALdouble)clocktime.Latency / 1000000000.0;
+            else
+            {
+                /* If the clock time incremented, reduce the latency by that
+                 * much since it's that much closer to the source offset it got
+                 * earlier.
+                 */
+                ALuint64 diff = clocktime.ClockTime - srcclock;
+                values[1] = (ALdouble)(clocktime.Latency - minu64(clocktime.Latency, diff)) /
+                            1000000000.0;
+            }
             return AL_TRUE;
 
         case AL_POSITION:
-            LockContext(Context);
-            values[0] = Source->Position.v[0];
-            values[1] = Source->Position.v[1];
-            values[2] = Source->Position.v[2];
-            UnlockContext(Context);
+            values[0] = Source->Position[0];
+            values[1] = Source->Position[1];
+            values[2] = Source->Position[2];
             return AL_TRUE;
 
         case AL_VELOCITY:
-            LockContext(Context);
-            values[0] = Source->Velocity.v[0];
-            values[1] = Source->Velocity.v[1];
-            values[2] = Source->Velocity.v[2];
-            UnlockContext(Context);
+            values[0] = Source->Velocity[0];
+            values[1] = Source->Velocity[1];
+            values[2] = Source->Velocity[2];
             return AL_TRUE;
 
         case AL_DIRECTION:
-            LockContext(Context);
-            values[0] = Source->Direction.v[0];
-            values[1] = Source->Direction.v[1];
-            values[2] = Source->Direction.v[2];
-            UnlockContext(Context);
+            values[0] = Source->Direction[0];
+            values[1] = Source->Direction[1];
+            values[2] = Source->Direction[2];
             return AL_TRUE;
 
         case AL_ORIENTATION:
-            LockContext(Context);
             values[0] = Source->Orientation[0][0];
             values[1] = Source->Orientation[0][1];
             values[2] = Source->Orientation[0][2];
             values[3] = Source->Orientation[1][0];
             values[4] = Source->Orientation[1][1];
             values[5] = Source->Orientation[1][2];
-            UnlockContext(Context);
             return AL_TRUE;
 
         /* 1x int */
@@ -1282,18 +1348,9 @@ static ALboolean GetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
         case AL_ROOM_ROLLOFF_FACTOR:
         case AL_CONE_OUTER_GAINHF:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             if((err=GetSourcedv(Source, Context, prop, dvals)) != AL_FALSE)
                 *values = (ALint)dvals[0];
-            return err;
-
-        /* 2x float/double */
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
-            if((err=GetSourcedv(Source, Context, prop, dvals)) != AL_FALSE)
-            {
-                values[0] = (ALint)dvals[0];
-                values[1] = (ALint)dvals[1];
-            }
             return err;
 
         /* 3x float/double */
@@ -1325,6 +1382,8 @@ static ALboolean GetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
             break; /* i64 only */
         case AL_SEC_OFFSET_LATENCY_SOFT:
             break; /* Double only */
+        case AL_STEREO_ANGLES:
+            break; /* Float/double only */
 
         case AL_DIRECT_FILTER:
         case AL_AUXILIARY_SEND_FILTER:
@@ -1338,6 +1397,8 @@ static ALboolean GetSourceiv(ALsource *Source, ALCcontext *Context, SourceProp p
 static ALboolean GetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp prop, ALint64 *values)
 {
     ALCdevice *device = Context->Device;
+    ClockLatency clocktime;
+    ALuint64 srcclock;
     ALdouble dvals[6];
     ALint ivals[3];
     ALboolean err;
@@ -1345,10 +1406,22 @@ static ALboolean GetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
     switch(prop)
     {
         case AL_SAMPLE_OFFSET_LATENCY_SOFT:
-            LockContext(Context);
-            values[0] = GetSourceSampleOffset(Source);
-            values[1] = V0(device->Backend,getLatency)();
-            UnlockContext(Context);
+            /* Get the source offset with the clock time first. Then get the
+             * clock time with the device latency. Order is important.
+             */
+            values[0] = GetSourceSampleOffset(Source, device, &srcclock);
+            clocktime = V0(device->Backend,getClockLatency)();
+            if(srcclock == (ALuint64)clocktime.ClockTime)
+                values[1] = clocktime.Latency;
+            else
+            {
+                /* If the clock time incremented, reduce the latency by that
+                 * much since it's that much closer to the source offset it got
+                 * earlier.
+                 */
+                ALuint64 diff = clocktime.ClockTime - srcclock;
+                values[1] = clocktime.Latency - minu64(clocktime.Latency, diff);
+            }
             return AL_TRUE;
 
         /* 1x float/double */
@@ -1370,18 +1443,9 @@ static ALboolean GetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
         case AL_ROOM_ROLLOFF_FACTOR:
         case AL_CONE_OUTER_GAINHF:
         case AL_SEC_LENGTH_SOFT:
+        case AL_SOURCE_RADIUS:
             if((err=GetSourcedv(Source, Context, prop, dvals)) != AL_FALSE)
                 *values = (ALint64)dvals[0];
-            return err;
-
-        /* 2x float/double */
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-        case AL_BYTE_RW_OFFSETS_SOFT:
-            if((err=GetSourcedv(Source, Context, prop, dvals)) != AL_FALSE)
-            {
-                values[0] = (ALint64)dvals[0];
-                values[1] = (ALint64)dvals[1];
-            }
             return err;
 
         /* 3x float/double */
@@ -1446,6 +1510,8 @@ static ALboolean GetSourcei64v(ALsource *Source, ALCcontext *Context, SourceProp
 
         case AL_SEC_OFFSET_LATENCY_SOFT:
             break; /* Double only */
+        case AL_STEREO_ANGLES:
+            break; /* Float/double only */
     }
 
     ERR("Unexpected property: 0x%04x\n", prop);
@@ -1498,13 +1564,13 @@ done:
 AL_API ALvoid AL_APIENTRY alDeleteSources(ALsizei n, const ALuint *sources)
 {
     ALCcontext *context;
-    ALbufferlistitem *BufferList;
     ALsource *Source;
-    ALsizei i, j;
+    ALsizei i;
 
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesWrite(context);
     if(!(n >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
 
@@ -1534,28 +1600,14 @@ AL_API ALvoid AL_APIENTRY alDeleteSources(ALsizei n, const ALuint *sources)
         }
         UnlockContext(context);
 
-        BufferList = ATOMIC_EXCHANGE(ALbufferlistitem*, &Source->queue, NULL);
-        while(BufferList != NULL)
-        {
-            ALbufferlistitem *next = BufferList->next;
-            if(BufferList->buffer != NULL)
-                DecrementRef(&BufferList->buffer->ref);
-            free(BufferList);
-            BufferList = next;
-        }
-
-        for(j = 0;j < MAX_SENDS;++j)
-        {
-            if(Source->Send[j].Slot)
-                DecrementRef(&Source->Send[j].Slot->ref);
-            Source->Send[j].Slot = NULL;
-        }
+        DeinitSource(Source);
 
         memset(Source, 0, sizeof(*Source));
         al_free(Source);
     }
 
 done:
+    UnlockSourcesWrite(context);
     ALCcontext_DecRef(context);
 }
 
@@ -1568,7 +1620,9 @@ AL_API ALboolean AL_APIENTRY alIsSource(ALuint source)
     context = GetContextRef();
     if(!context) return AL_FALSE;
 
+    LockSourcesRead(context);
     ret = (LookupSource(context, source) ? AL_TRUE : AL_FALSE);
+    UnlockSourcesRead(context);
 
     ALCcontext_DecRef(context);
 
@@ -1584,12 +1638,16 @@ AL_API ALvoid AL_APIENTRY alSourcef(ALuint source, ALenum param, ALfloat value)
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(FloatValsByProp(param) == 1))
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourcefv(Source, Context, param, &value);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1602,6 +1660,8 @@ AL_API ALvoid AL_APIENTRY alSource3f(ALuint source, ALenum param, ALfloat value1
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(FloatValsByProp(param) == 3))
@@ -1611,6 +1671,8 @@ AL_API ALvoid AL_APIENTRY alSource3f(ALuint source, ALenum param, ALfloat value1
         ALfloat fvals[3] = { value1, value2, value3 };
         SetSourcefv(Source, Context, param, fvals);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1623,6 +1685,8 @@ AL_API ALvoid AL_APIENTRY alSourcefv(ALuint source, ALenum param, const ALfloat 
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1631,6 +1695,8 @@ AL_API ALvoid AL_APIENTRY alSourcefv(ALuint source, ALenum param, const ALfloat 
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourcefv(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1644,6 +1710,8 @@ AL_API ALvoid AL_APIENTRY alSourcedSOFT(ALuint source, ALenum param, ALdouble va
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(DoubleValsByProp(param) == 1))
@@ -1653,6 +1721,8 @@ AL_API ALvoid AL_APIENTRY alSourcedSOFT(ALuint source, ALenum param, ALdouble va
         ALfloat fval = (ALfloat)value;
         SetSourcefv(Source, Context, param, &fval);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1665,6 +1735,8 @@ AL_API ALvoid AL_APIENTRY alSource3dSOFT(ALuint source, ALenum param, ALdouble v
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(DoubleValsByProp(param) == 3))
@@ -1674,6 +1746,8 @@ AL_API ALvoid AL_APIENTRY alSource3dSOFT(ALuint source, ALenum param, ALdouble v
         ALfloat fvals[3] = { (ALfloat)value1, (ALfloat)value2, (ALfloat)value3 };
         SetSourcefv(Source, Context, param, fvals);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1687,6 +1761,8 @@ AL_API ALvoid AL_APIENTRY alSourcedvSOFT(ALuint source, ALenum param, const ALdo
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1702,6 +1778,8 @@ AL_API ALvoid AL_APIENTRY alSourcedvSOFT(ALuint source, ALenum param, const ALdo
             fvals[i] = (ALfloat)values[i];
         SetSourcefv(Source, Context, param, fvals);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1715,12 +1793,16 @@ AL_API ALvoid AL_APIENTRY alSourcei(ALuint source, ALenum param, ALint value)
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(IntValsByProp(param) == 1))
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourceiv(Source, Context, param, &value);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1733,6 +1815,8 @@ AL_API void AL_APIENTRY alSource3i(ALuint source, ALenum param, ALint value1, AL
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(IntValsByProp(param) == 3))
@@ -1742,6 +1826,8 @@ AL_API void AL_APIENTRY alSource3i(ALuint source, ALenum param, ALint value1, AL
         ALint ivals[3] = { value1, value2, value3 };
         SetSourceiv(Source, Context, param, ivals);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1754,6 +1840,8 @@ AL_API void AL_APIENTRY alSourceiv(ALuint source, ALenum param, const ALint *val
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1762,6 +1850,8 @@ AL_API void AL_APIENTRY alSourceiv(ALuint source, ALenum param, const ALint *val
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourceiv(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1775,12 +1865,16 @@ AL_API ALvoid AL_APIENTRY alSourcei64SOFT(ALuint source, ALenum param, ALint64SO
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(Int64ValsByProp(param) == 1))
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourcei64v(Source, Context, param, &value);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1793,6 +1887,8 @@ AL_API void AL_APIENTRY alSource3i64SOFT(ALuint source, ALenum param, ALint64SOF
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(Int64ValsByProp(param) == 3))
@@ -1802,6 +1898,8 @@ AL_API void AL_APIENTRY alSource3i64SOFT(ALuint source, ALenum param, ALint64SOF
         ALint64SOFT i64vals[3] = { value1, value2, value3 };
         SetSourcei64v(Source, Context, param, i64vals);
     }
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1814,6 +1912,8 @@ AL_API void AL_APIENTRY alSourcei64vSOFT(ALuint source, ALenum param, const ALin
     Context = GetContextRef();
     if(!Context) return;
 
+    WriteLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1822,6 +1922,8 @@ AL_API void AL_APIENTRY alSourcei64vSOFT(ALuint source, ALenum param, const ALin
         alSetError(Context, AL_INVALID_ENUM);
     else
         SetSourcei64v(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    WriteUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1835,6 +1937,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcef(ALuint source, ALenum param, ALfloat *val
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!value)
@@ -1847,6 +1951,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcef(ALuint source, ALenum param, ALfloat *val
         if(GetSourcedv(Source, Context, param, &dval))
             *value = (ALfloat)dval;
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1860,6 +1966,8 @@ AL_API ALvoid AL_APIENTRY alGetSource3f(ALuint source, ALenum param, ALfloat *va
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(value1 && value2 && value3))
@@ -1876,6 +1984,8 @@ AL_API ALvoid AL_APIENTRY alGetSource3f(ALuint source, ALenum param, ALfloat *va
             *value3 = (ALfloat)dvals[2];
         }
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1890,6 +2000,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcefv(ALuint source, ALenum param, ALfloat *va
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1906,6 +2018,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcefv(ALuint source, ALenum param, ALfloat *va
                 values[i] = (ALfloat)dvals[i];
         }
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1919,6 +2033,8 @@ AL_API void AL_APIENTRY alGetSourcedSOFT(ALuint source, ALenum param, ALdouble *
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!value)
@@ -1927,6 +2043,8 @@ AL_API void AL_APIENTRY alGetSourcedSOFT(ALuint source, ALenum param, ALdouble *
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourcedv(Source, Context, param, value);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1939,6 +2057,8 @@ AL_API void AL_APIENTRY alGetSource3dSOFT(ALuint source, ALenum param, ALdouble 
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(value1 && value2 && value3))
@@ -1955,6 +2075,8 @@ AL_API void AL_APIENTRY alGetSource3dSOFT(ALuint source, ALenum param, ALdouble 
             *value3 = dvals[2];
         }
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1967,6 +2089,8 @@ AL_API void AL_APIENTRY alGetSourcedvSOFT(ALuint source, ALenum param, ALdouble 
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -1975,6 +2099,8 @@ AL_API void AL_APIENTRY alGetSourcedvSOFT(ALuint source, ALenum param, ALdouble 
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourcedv(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -1988,6 +2114,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcei(ALuint source, ALenum param, ALint *value
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!value)
@@ -1996,6 +2124,8 @@ AL_API ALvoid AL_APIENTRY alGetSourcei(ALuint source, ALenum param, ALint *value
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourceiv(Source, Context, param, value);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2009,6 +2139,8 @@ AL_API void AL_APIENTRY alGetSource3i(ALuint source, ALenum param, ALint *value1
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(value1 && value2 && value3))
@@ -2025,6 +2157,8 @@ AL_API void AL_APIENTRY alGetSource3i(ALuint source, ALenum param, ALint *value1
             *value3 = ivals[2];
         }
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2038,6 +2172,8 @@ AL_API void AL_APIENTRY alGetSourceiv(ALuint source, ALenum param, ALint *values
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -2046,6 +2182,8 @@ AL_API void AL_APIENTRY alGetSourceiv(ALuint source, ALenum param, ALint *values
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourceiv(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2059,6 +2197,8 @@ AL_API void AL_APIENTRY alGetSourcei64SOFT(ALuint source, ALenum param, ALint64S
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!value)
@@ -2067,6 +2207,8 @@ AL_API void AL_APIENTRY alGetSourcei64SOFT(ALuint source, ALenum param, ALint64S
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourcei64v(Source, Context, param, value);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2079,6 +2221,8 @@ AL_API void AL_APIENTRY alGetSource3i64SOFT(ALuint source, ALenum param, ALint64
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!(value1 && value2 && value3))
@@ -2095,6 +2239,8 @@ AL_API void AL_APIENTRY alGetSource3i64SOFT(ALuint source, ALenum param, ALint64
             *value3 = i64vals[2];
         }
     }
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2107,6 +2253,8 @@ AL_API void AL_APIENTRY alGetSourcei64vSOFT(ALuint source, ALenum param, ALint64
     Context = GetContextRef();
     if(!Context) return;
 
+    ReadLock(&Context->PropLock);
+    LockSourcesRead(Context);
     if((Source=LookupSource(Context, source)) == NULL)
         alSetError(Context, AL_INVALID_NAME);
     else if(!values)
@@ -2115,6 +2263,8 @@ AL_API void AL_APIENTRY alGetSourcei64vSOFT(ALuint source, ALenum param, ALint64
         alSetError(Context, AL_INVALID_ENUM);
     else
         GetSourcei64v(Source, Context, param, values);
+    UnlockSourcesRead(Context);
+    ReadUnlock(&Context->PropLock);
 
     ALCcontext_DecRef(Context);
 }
@@ -2133,6 +2283,7 @@ AL_API ALvoid AL_APIENTRY alSourcePlayv(ALsizei n, const ALuint *sources)
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesRead(context);
     if(!(n >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
     for(i = 0;i < n;i++)
@@ -2149,14 +2300,16 @@ AL_API ALvoid AL_APIENTRY alSourcePlayv(ALsizei n, const ALuint *sources)
 
         newcount = context->MaxVoices << 1;
         if(newcount > 0)
-            temp = realloc(context->Voices, newcount * sizeof(context->Voices[0]));
+            temp = al_malloc(16, newcount * sizeof(context->Voices[0]));
         if(!temp)
         {
             UnlockContext(context);
             SET_ERROR_AND_GOTO(context, AL_OUT_OF_MEMORY, done);
         }
+        memcpy(temp, context->Voices, context->MaxVoices * sizeof(temp[0]));
         memset(&temp[context->MaxVoices], 0, (newcount-context->MaxVoices) * sizeof(temp[0]));
 
+        al_free(context->Voices);
         context->Voices = temp;
         context->MaxVoices = newcount;
     }
@@ -2164,12 +2317,15 @@ AL_API ALvoid AL_APIENTRY alSourcePlayv(ALsizei n, const ALuint *sources)
     for(i = 0;i < n;i++)
     {
         source = LookupSource(context, sources[i]);
-        if(context->DeferUpdates) source->new_state = AL_PLAYING;
-        else SetSourceState(source, context, AL_PLAYING);
+        if(ATOMIC_LOAD(&context->DeferUpdates, almemory_order_acquire))
+            source->new_state = AL_PLAYING;
+        else
+            SetSourceState(source, context, AL_PLAYING);
     }
     UnlockContext(context);
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2186,6 +2342,7 @@ AL_API ALvoid AL_APIENTRY alSourcePausev(ALsizei n, const ALuint *sources)
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesRead(context);
     if(!(n >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
     for(i = 0;i < n;i++)
@@ -2198,12 +2355,15 @@ AL_API ALvoid AL_APIENTRY alSourcePausev(ALsizei n, const ALuint *sources)
     for(i = 0;i < n;i++)
     {
         source = LookupSource(context, sources[i]);
-        if(context->DeferUpdates) source->new_state = AL_PAUSED;
-        else SetSourceState(source, context, AL_PAUSED);
+        if(ATOMIC_LOAD(&context->DeferUpdates, almemory_order_acquire))
+            source->new_state = AL_PAUSED;
+        else
+            SetSourceState(source, context, AL_PAUSED);
     }
     UnlockContext(context);
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2220,6 +2380,7 @@ AL_API ALvoid AL_APIENTRY alSourceStopv(ALsizei n, const ALuint *sources)
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesRead(context);
     if(!(n >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
     for(i = 0;i < n;i++)
@@ -2238,6 +2399,7 @@ AL_API ALvoid AL_APIENTRY alSourceStopv(ALsizei n, const ALuint *sources)
     UnlockContext(context);
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2254,6 +2416,7 @@ AL_API ALvoid AL_APIENTRY alSourceRewindv(ALsizei n, const ALuint *sources)
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesRead(context);
     if(!(n >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
     for(i = 0;i < n;i++)
@@ -2272,6 +2435,7 @@ AL_API ALvoid AL_APIENTRY alSourceRewindv(ALsizei n, const ALuint *sources)
     UnlockContext(context);
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2294,6 +2458,7 @@ AL_API ALvoid AL_APIENTRY alSourceQueueBuffers(ALuint src, ALsizei nb, const ALu
 
     device = context->Device;
 
+    LockSourcesRead(context);
     if(!(nb >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
     if((source=LookupSource(context, src)) == NULL)
@@ -2319,6 +2484,7 @@ AL_API ALvoid AL_APIENTRY alSourceQueueBuffers(ALuint src, ALsizei nb, const ALu
         BufferList = BufferList->next;
     }
 
+    LockBuffersRead(device);
     BufferListStart = NULL;
     BufferList = NULL;
     for(i = 0;i < nb;i++)
@@ -2378,6 +2544,7 @@ AL_API ALvoid AL_APIENTRY alSourceQueueBuffers(ALuint src, ALsizei nb, const ALu
                 free(BufferListStart);
                 BufferListStart = next;
             }
+            UnlockBuffersRead(device);
             goto done;
         }
     }
@@ -2389,6 +2556,7 @@ AL_API ALvoid AL_APIENTRY alSourceQueueBuffers(ALuint src, ALsizei nb, const ALu
         if(buffer) ReadUnlock(&buffer->lock);
         BufferList = BufferList->next;
     }
+    UnlockBuffersRead(device);
 
     /* Source is now streaming */
     source->SourceType = AL_STREAMING;
@@ -2409,6 +2577,7 @@ AL_API ALvoid AL_APIENTRY alSourceQueueBuffers(ALuint src, ALsizei nb, const ALu
     WriteUnlock(&source->queue_lock);
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2427,6 +2596,7 @@ AL_API ALvoid AL_APIENTRY alSourceUnqueueBuffers(ALuint src, ALsizei nb, ALuint 
     context = GetContextRef();
     if(!context) return;
 
+    LockSourcesRead(context);
     if(!(nb >= 0))
         SET_ERROR_AND_GOTO(context, AL_INVALID_VALUE, done);
 
@@ -2490,6 +2660,7 @@ AL_API ALvoid AL_APIENTRY alSourceUnqueueBuffers(ALuint src, ALsizei nb, ALuint 
     }
 
 done:
+    UnlockSourcesRead(context);
     ALCcontext_DecRef(context);
 }
 
@@ -2503,9 +2674,15 @@ static ALvoid InitSourceParams(ALsource *Source)
     Source->InnerAngle = 360.0f;
     Source->OuterAngle = 360.0f;
     Source->Pitch = 1.0f;
-    aluVectorSet(&Source->Position, 0.0f, 0.0f, 0.0f, 1.0f);
-    aluVectorSet(&Source->Velocity, 0.0f, 0.0f, 0.0f, 0.0f);
-    aluVectorSet(&Source->Direction, 0.0f, 0.0f, 0.0f, 0.0f);
+    Source->Position[0] = 0.0f;
+    Source->Position[1] = 0.0f;
+    Source->Position[2] = 0.0f;
+    Source->Velocity[0] = 0.0f;
+    Source->Velocity[1] = 0.0f;
+    Source->Velocity[2] = 0.0f;
+    Source->Direction[0] = 0.0f;
+    Source->Direction[1] = 0.0f;
+    Source->Direction[2] = 0.0f;
     Source->Orientation[0][0] =  0.0f;
     Source->Orientation[0][1] =  0.0f;
     Source->Orientation[0][2] = -1.0f;
@@ -2530,17 +2707,12 @@ static ALvoid InitSourceParams(ALsource *Source)
     Source->DopplerFactor = 1.0f;
     Source->DirectChannels = AL_FALSE;
 
+    Source->StereoPan[0] = DEG2RAD( 30.0f);
+    Source->StereoPan[1] = DEG2RAD(-30.0f);
+
     Source->Radius = 0.0f;
 
     Source->DistanceModel = DefaultDistanceModel;
-
-    Source->state = AL_INITIAL;
-    Source->new_state = AL_NONE;
-    Source->SourceType = AL_UNDETERMINED;
-    Source->Offset = -1.0;
-
-    ATOMIC_INIT(&Source->queue, NULL);
-    ATOMIC_INIT(&Source->current_buffer, NULL);
 
     Source->Direct.Gain = 1.0f;
     Source->Direct.GainHF = 1.0f;
@@ -2556,7 +2728,184 @@ static ALvoid InitSourceParams(ALsource *Source)
         Source->Send[i].LFReference = HIGHPASSFREQREF;
     }
 
-    ATOMIC_INIT(&Source->NeedsUpdate, AL_TRUE);
+    Source->state = AL_INITIAL;
+    Source->new_state = AL_NONE;
+    Source->SourceType = AL_UNDETERMINED;
+    Source->OffsetType = AL_NONE;
+    Source->Offset = 0.0;
+
+    ATOMIC_INIT(&Source->queue, NULL);
+    ATOMIC_INIT(&Source->current_buffer, NULL);
+
+    ATOMIC_INIT(&Source->Update, NULL);
+    ATOMIC_INIT(&Source->FreeList, NULL);
+}
+
+static ALvoid DeinitSource(ALsource *source)
+{
+    ALbufferlistitem *BufferList;
+    struct ALsourceProps *props;
+    size_t count = 0;
+    size_t i;
+
+    props = ATOMIC_LOAD(&source->Update);
+    if(props) al_free(props);
+
+    props = ATOMIC_LOAD(&source->FreeList, almemory_order_relaxed);
+    while(props)
+    {
+        struct ALsourceProps *next;
+        next = ATOMIC_LOAD(&props->next, almemory_order_relaxed);
+        al_free(props);
+        props = next;
+        ++count;
+    }
+    /* This is excessively spammy if it traces every source destruction, so
+     * just warn if it was unexpectedly large.
+     */
+    if(count > 3)
+        WARN("Freed "SZFMT" Source property objects\n", count);
+
+    BufferList = ATOMIC_EXCHANGE(ALbufferlistitem*, &source->queue, NULL);
+    while(BufferList != NULL)
+    {
+        ALbufferlistitem *next = BufferList->next;
+        if(BufferList->buffer != NULL)
+            DecrementRef(&BufferList->buffer->ref);
+        free(BufferList);
+        BufferList = next;
+    }
+
+    for(i = 0;i < MAX_SENDS;++i)
+    {
+        if(source->Send[i].Slot)
+            DecrementRef(&source->Send[i].Slot->ref);
+        source->Send[i].Slot = NULL;
+    }
+}
+
+void UpdateSourceProps(ALsource *source, ALuint num_sends, ALCcontext *context)
+{
+    struct ALsourceProps *props;
+    size_t i;
+
+    /* Get an unused property container, or allocate a new one as needed. */
+    props = ATOMIC_LOAD(&source->FreeList, almemory_order_acquire);
+    if(!props)
+        props = al_calloc(16, sizeof(*props));
+    else
+    {
+        struct ALsourceProps *next;
+        do {
+            next = ATOMIC_LOAD(&props->next, almemory_order_relaxed);
+        } while(ATOMIC_COMPARE_EXCHANGE_WEAK(struct ALsourceProps*,
+                &source->FreeList, &props, next, almemory_order_seq_cst,
+                almemory_order_consume) == 0);
+    }
+
+    /* Copy in current property values. */
+    ATOMIC_STORE(&props->Pitch, source->Pitch, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Gain, source->Gain, almemory_order_relaxed);
+    ATOMIC_STORE(&props->OuterGain, source->OuterGain, almemory_order_relaxed);
+    ATOMIC_STORE(&props->MinGain, source->MinGain, almemory_order_relaxed);
+    ATOMIC_STORE(&props->MaxGain, source->MaxGain, almemory_order_relaxed);
+    ATOMIC_STORE(&props->InnerAngle, source->InnerAngle, almemory_order_relaxed);
+    ATOMIC_STORE(&props->OuterAngle, source->OuterAngle, almemory_order_relaxed);
+    ATOMIC_STORE(&props->RefDistance, source->RefDistance, almemory_order_relaxed);
+    ATOMIC_STORE(&props->MaxDistance, source->MaxDistance, almemory_order_relaxed);
+    ATOMIC_STORE(&props->RollOffFactor, source->RollOffFactor, almemory_order_relaxed);
+    for(i = 0;i < 3;i++)
+        ATOMIC_STORE(&props->Position[i], source->Position[i], almemory_order_relaxed);
+    for(i = 0;i < 3;i++)
+        ATOMIC_STORE(&props->Velocity[i], source->Velocity[i], almemory_order_relaxed);
+    for(i = 0;i < 3;i++)
+        ATOMIC_STORE(&props->Direction[i], source->Direction[i], almemory_order_relaxed);
+    for(i = 0;i < 2;i++)
+    {
+        size_t j;
+        for(j = 0;j < 3;j++)
+            ATOMIC_STORE(&props->Orientation[i][j], source->Orientation[i][j],
+                        almemory_order_relaxed);
+    }
+    ATOMIC_STORE(&props->HeadRelative, source->HeadRelative, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Looping, source->Looping, almemory_order_relaxed);
+    ATOMIC_STORE(&props->DistanceModel,
+        context->SourceDistanceModel ?  source->DistanceModel : context->DistanceModel,
+        almemory_order_relaxed
+    );
+    ATOMIC_STORE(&props->DirectChannels, source->DirectChannels, almemory_order_relaxed);
+
+    ATOMIC_STORE(&props->DryGainHFAuto, source->DryGainHFAuto, almemory_order_relaxed);
+    ATOMIC_STORE(&props->WetGainAuto, source->WetGainAuto, almemory_order_relaxed);
+    ATOMIC_STORE(&props->WetGainHFAuto, source->WetGainHFAuto, almemory_order_relaxed);
+    ATOMIC_STORE(&props->OuterGainHF, source->OuterGainHF, almemory_order_relaxed);
+
+    ATOMIC_STORE(&props->AirAbsorptionFactor, source->AirAbsorptionFactor, almemory_order_relaxed);
+    ATOMIC_STORE(&props->RoomRolloffFactor, source->RoomRolloffFactor, almemory_order_relaxed);
+    ATOMIC_STORE(&props->DopplerFactor, source->DopplerFactor, almemory_order_relaxed);
+
+    ATOMIC_STORE(&props->StereoPan[0], source->StereoPan[0], almemory_order_relaxed);
+    ATOMIC_STORE(&props->StereoPan[1], source->StereoPan[1], almemory_order_relaxed);
+
+    ATOMIC_STORE(&props->Radius, source->Radius, almemory_order_relaxed);
+
+    ATOMIC_STORE(&props->Direct.Gain, source->Direct.Gain, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Direct.GainHF, source->Direct.GainHF, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Direct.HFReference, source->Direct.HFReference, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Direct.GainLF, source->Direct.GainLF, almemory_order_relaxed);
+    ATOMIC_STORE(&props->Direct.LFReference, source->Direct.LFReference, almemory_order_relaxed);
+
+    for(i = 0;i < num_sends;i++)
+    {
+        ATOMIC_STORE(&props->Send[i].Slot, source->Send[i].Slot, almemory_order_relaxed);
+        ATOMIC_STORE(&props->Send[i].Gain, source->Send[i].Gain, almemory_order_relaxed);
+        ATOMIC_STORE(&props->Send[i].GainHF, source->Send[i].GainHF, almemory_order_relaxed);
+        ATOMIC_STORE(&props->Send[i].HFReference, source->Send[i].HFReference,
+                     almemory_order_relaxed);
+        ATOMIC_STORE(&props->Send[i].GainLF, source->Send[i].GainLF, almemory_order_relaxed);
+        ATOMIC_STORE(&props->Send[i].LFReference, source->Send[i].LFReference,
+                     almemory_order_relaxed);
+    }
+
+    /* Set the new container for updating internal parameters. */
+    props = ATOMIC_EXCHANGE(struct ALsourceProps*, &source->Update, props, almemory_order_acq_rel);
+    if(props)
+    {
+        /* If there was an unused update container, put it back in the
+         * freelist.
+         */
+        struct ALsourceProps *first = ATOMIC_LOAD(&source->FreeList);
+        do {
+            ATOMIC_STORE(&props->next, first, almemory_order_relaxed);
+        } while(ATOMIC_COMPARE_EXCHANGE_WEAK(struct ALsourceProps*,
+                &source->FreeList, &first, props) == 0);
+    }
+}
+
+void UpdateAllSourceProps(ALCcontext *context)
+{
+    ALuint num_sends = context->Device->NumAuxSends;
+    uint updates;
+    ALsizei pos;
+
+    /* Tell the mixer to stop applying updates, then wait for any active
+     * updating to finish, before providing source updates.
+     */
+    ATOMIC_STORE(&context->HoldUpdates, AL_TRUE);
+    while(((updates=ReadRef(&context->UpdateCount))&1) != 0)
+        althrd_yield();
+    for(pos = 0;pos < context->VoiceCount;pos++)
+    {
+        ALvoice *voice = &context->Voices[pos];
+        ALsource *source = voice->Source;
+        if(source != NULL && (source->state == AL_PLAYING ||
+                              source->state == AL_PAUSED))
+            UpdateSourceProps(source, num_sends, context);
+    }
+    /* Now with all updates declared, let the mixer continue applying them so
+     * they all happen at once.
+     */
+    ATOMIC_STORE(&context->HoldUpdates, AL_FALSE);
 }
 
 
@@ -2589,8 +2938,8 @@ ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state)
         if(Source->state != AL_PAUSED)
         {
             Source->state = AL_PLAYING;
-            Source->position = 0;
-            Source->position_fraction = 0;
+            ATOMIC_STORE(&Source->position, 0, almemory_order_relaxed);
+            ATOMIC_STORE(&Source->position_fraction, 0, almemory_order_relaxed);
             ATOMIC_STORE(&Source->current_buffer, BufferList);
             discontinuity = AL_TRUE;
         }
@@ -2601,7 +2950,7 @@ ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state)
         }
 
         // Check if an Offset has been set
-        if(Source->Offset >= 0.0)
+        if(Source->OffsetType != AL_NONE)
         {
             ApplyOffset(Source);
             /* discontinuity = AL_TRUE;??? */
@@ -2653,12 +3002,7 @@ ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state)
             }
         }
 
-        if(BufferList->buffer->FmtChannels == FmtMono)
-            voice->Update = CalcSourceParams;
-        else
-            voice->Update = CalcNonAttnSourceParams;
-
-        ATOMIC_STORE(&Source->NeedsUpdate, AL_TRUE);
+        UpdateSourceProps(Source, device->NumAuxSends, Context);
     }
     else if(state == AL_PAUSED)
     {
@@ -2673,18 +3017,20 @@ ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state)
             Source->state = AL_STOPPED;
             ATOMIC_STORE(&Source->current_buffer, NULL);
         }
-        Source->Offset = -1.0;
+        Source->OffsetType = AL_NONE;
+        Source->Offset = 0.0;
     }
     else if(state == AL_INITIAL)
     {
         if(Source->state != AL_INITIAL)
         {
             Source->state = AL_INITIAL;
-            Source->position = 0;
-            Source->position_fraction = 0;
+            ATOMIC_STORE(&Source->position, 0, almemory_order_relaxed);
+            ATOMIC_STORE(&Source->position_fraction, 0, almemory_order_relaxed);
             ATOMIC_STORE(&Source->current_buffer, ATOMIC_LOAD(&Source->queue));
         }
-        Source->Offset = -1.0;
+        Source->OffsetType = AL_NONE;
+        Source->Offset = 0.0;
     }
     WriteUnlock(&Source->queue_lock);
 }
@@ -2695,25 +3041,37 @@ ALvoid SetSourceState(ALsource *Source, ALCcontext *Context, ALenum state)
  * samples. The offset is relative to the start of the queue (not the start of
  * the current buffer).
  */
-ALint64 GetSourceSampleOffset(ALsource *Source)
+ALint64 GetSourceSampleOffset(ALsource *Source, ALCdevice *device, ALuint64 *clocktime)
 {
     const ALbufferlistitem *BufferList;
     const ALbufferlistitem *Current;
     ALuint64 readPos;
+    ALuint refcount;
 
     ReadLock(&Source->queue_lock);
     if(Source->state != AL_PLAYING && Source->state != AL_PAUSED)
     {
         ReadUnlock(&Source->queue_lock);
+        do {
+            while(((refcount=ReadRef(&device->MixCount))&1))
+                althrd_yield();
+            *clocktime = GetDeviceClockTime(device);
+        } while(refcount != ReadRef(&device->MixCount));
         return 0;
     }
 
-    /* NOTE: This is the offset into the *current* buffer, so add the length of
-     * any played buffers */
-    readPos  = (ALuint64)Source->position << 32;
-    readPos |= (ALuint64)Source->position_fraction << (32-FRACTIONBITS);
-    BufferList = ATOMIC_LOAD(&Source->queue);
-    Current = ATOMIC_LOAD(&Source->current_buffer);
+    do {
+        while(((refcount=ReadRef(&device->MixCount))&1))
+            althrd_yield();
+        *clocktime = GetDeviceClockTime(device);
+        /* NOTE: This is the offset into the *current* buffer, so add the length of
+         * any played buffers */
+        readPos  = (ALuint64)ATOMIC_LOAD(&Source->position, almemory_order_relaxed) << 32;
+        readPos |= (ALuint64)ATOMIC_LOAD(&Source->position_fraction, almemory_order_relaxed) <<
+                   (32-FRACTIONBITS);
+        BufferList = ATOMIC_LOAD(&Source->queue, almemory_order_relaxed);
+        Current = ATOMIC_LOAD(&Source->current_buffer, almemory_order_relaxed);
+    } while(refcount != ReadRef(&device->MixCount));
     while(BufferList && BufferList != Current)
     {
         if(BufferList->buffer)
@@ -2730,26 +3088,37 @@ ALint64 GetSourceSampleOffset(ALsource *Source)
  * Gets the current read offset for the given Source, in seconds. The offset is
  * relative to the start of the queue (not the start of the current buffer).
  */
-static ALdouble GetSourceSecOffset(ALsource *Source)
+static ALdouble GetSourceSecOffset(ALsource *Source, ALCdevice *device, ALuint64 *clocktime)
 {
     const ALbufferlistitem *BufferList;
     const ALbufferlistitem *Current;
     const ALbuffer *Buffer = NULL;
     ALuint64 readPos;
+    ALuint refcount;
 
     ReadLock(&Source->queue_lock);
     if(Source->state != AL_PLAYING && Source->state != AL_PAUSED)
     {
         ReadUnlock(&Source->queue_lock);
+        do {
+            while(((refcount=ReadRef(&device->MixCount))&1))
+                althrd_yield();
+            *clocktime = GetDeviceClockTime(device);
+        } while(refcount != ReadRef(&device->MixCount));
         return 0.0;
     }
 
-    /* NOTE: This is the offset into the *current* buffer, so add the length of
-     * any played buffers */
-    readPos  = (ALuint64)Source->position << FRACTIONBITS;
-    readPos |= (ALuint64)Source->position_fraction;
-    BufferList = ATOMIC_LOAD(&Source->queue);
-    Current = ATOMIC_LOAD(&Source->current_buffer);
+    do {
+        while(((refcount=ReadRef(&device->MixCount))&1))
+            althrd_yield();
+        *clocktime = GetDeviceClockTime(device);
+        /* NOTE: This is the offset into the *current* buffer, so add the length of
+         * any played buffers */
+        readPos  = (ALuint64)ATOMIC_LOAD(&Source->position, almemory_order_relaxed) << FRACTIONBITS;
+        readPos |= (ALuint64)ATOMIC_LOAD(&Source->position_fraction, almemory_order_relaxed);
+        BufferList = ATOMIC_LOAD(&Source->queue, almemory_order_relaxed);
+        Current = ATOMIC_LOAD(&Source->current_buffer, almemory_order_relaxed);
+    } while(refcount != ReadRef(&device->MixCount));
     while(BufferList && BufferList != Current)
     {
         const ALbuffer *buffer = BufferList->buffer;
@@ -2772,40 +3141,42 @@ static ALdouble GetSourceSecOffset(ALsource *Source)
     return (ALdouble)readPos / (ALdouble)FRACTIONONE / (ALdouble)Buffer->Frequency;
 }
 
-/* GetSourceOffsets
+/* GetSourceOffset
  *
- * Gets the current read and write offsets for the given Source, in the
- * appropriate format (Bytes, Samples or Seconds). The offsets are relative to
- * the start of the queue (not the start of the current buffer).
+ * Gets the current read offset for the given Source, in the appropriate format
+ * (Bytes, Samples or Seconds). The offset is relative to the start of the
+ * queue (not the start of the current buffer).
  */
-static ALvoid GetSourceOffsets(ALsource *Source, ALenum name, ALdouble *offset, ALdouble updateLen)
+static ALdouble GetSourceOffset(ALsource *Source, ALenum name, ALCdevice *device)
 {
     const ALbufferlistitem *BufferList;
     const ALbufferlistitem *Current;
     const ALbuffer *Buffer = NULL;
     ALboolean readFin = AL_FALSE;
-    ALuint readPos, readPosFrac, writePos;
+    ALuint readPos, readPosFrac;
     ALuint totalBufferLen;
+    ALdouble offset = 0.0;
+    ALuint refcount;
 
     ReadLock(&Source->queue_lock);
     if(Source->state != AL_PLAYING && Source->state != AL_PAUSED)
     {
-        offset[0] = 0.0;
-        offset[1] = 0.0;
         ReadUnlock(&Source->queue_lock);
-        return;
+        return 0.0;
     }
 
-    if(updateLen > 0.0 && updateLen < 0.015)
-        updateLen = 0.015;
-
-    /* NOTE: This is the offset into the *current* buffer, so add the length of
-     * any played buffers */
     totalBufferLen = 0;
-    readPos = Source->position;
-    readPosFrac = Source->position_fraction;
-    BufferList = ATOMIC_LOAD(&Source->queue);
-    Current = ATOMIC_LOAD(&Source->current_buffer);
+    do {
+        while(((refcount=ReadRef(&device->MixCount))&1))
+            althrd_yield();
+        /* NOTE: This is the offset into the *current* buffer, so add the length of
+         * any played buffers */
+        readPos = ATOMIC_LOAD(&Source->position, almemory_order_relaxed);
+        readPosFrac = ATOMIC_LOAD(&Source->position_fraction, almemory_order_relaxed);
+        BufferList = ATOMIC_LOAD(&Source->queue, almemory_order_relaxed);
+        Current = ATOMIC_LOAD(&Source->current_buffer, almemory_order_relaxed);
+    } while(refcount != ReadRef(&device->MixCount));
+
     while(BufferList != NULL)
     {
         const ALbuffer *buffer;
@@ -2820,40 +3191,26 @@ static ALvoid GetSourceOffsets(ALsource *Source, ALenum name, ALdouble *offset, 
     }
     assert(Buffer != NULL);
 
-    if(Source->state == AL_PLAYING)
-        writePos = readPos + (ALuint)(updateLen*Buffer->Frequency + 0.5f);
-    else
-        writePos = readPos;
-
     if(Source->Looping)
-    {
         readPos %= totalBufferLen;
-        writePos %= totalBufferLen;
-    }
     else
     {
-        /* Wrap positions back to 0 */
+        /* Wrap back to 0 */
         if(readPos >= totalBufferLen)
             readPos = readPosFrac = 0;
-        if(writePos >= totalBufferLen)
-            writePos = 0;
     }
 
     switch(name)
     {
         case AL_SEC_OFFSET:
-            offset[0] = (readPos + (ALdouble)readPosFrac/FRACTIONONE)/Buffer->Frequency;
-            offset[1] = (ALdouble)writePos/Buffer->Frequency;
+            offset = (readPos + (ALdouble)readPosFrac/FRACTIONONE)/Buffer->Frequency;
             break;
 
         case AL_SAMPLE_OFFSET:
-        case AL_SAMPLE_RW_OFFSETS_SOFT:
-            offset[0] = readPos + (ALdouble)readPosFrac/FRACTIONONE;
-            offset[1] = (ALdouble)writePos;
+            offset = readPos + (ALdouble)readPosFrac/FRACTIONONE;
             break;
 
         case AL_BYTE_OFFSET:
-        case AL_BYTE_RW_OFFSETS_SOFT:
             if(Buffer->OriginalType == UserFmtIMA4)
             {
                 ALsizei align = (Buffer->OriginalAlign-1)/2 + 4;
@@ -2861,15 +3218,7 @@ static ALvoid GetSourceOffsets(ALsource *Source, ALenum name, ALdouble *offset, 
                 ALuint FrameBlockSize = Buffer->OriginalAlign;
 
                 /* Round down to nearest ADPCM block */
-                offset[0] = (ALdouble)(readPos / FrameBlockSize * BlockSize);
-                if(Source->state != AL_PLAYING)
-                    offset[1] = offset[0];
-                else
-                {
-                    /* Round up to nearest ADPCM block */
-                    offset[1] = (ALdouble)((writePos+FrameBlockSize-1) /
-                                           FrameBlockSize * BlockSize);
-                }
+                offset = (ALdouble)(readPos / FrameBlockSize * BlockSize);
             }
             else if(Buffer->OriginalType == UserFmtMSADPCM)
             {
@@ -2878,26 +3227,18 @@ static ALvoid GetSourceOffsets(ALsource *Source, ALenum name, ALdouble *offset, 
                 ALuint FrameBlockSize = Buffer->OriginalAlign;
 
                 /* Round down to nearest ADPCM block */
-                offset[0] = (ALdouble)(readPos / FrameBlockSize * BlockSize);
-                if(Source->state != AL_PLAYING)
-                    offset[1] = offset[0];
-                else
-                {
-                    /* Round up to nearest ADPCM block */
-                    offset[1] = (ALdouble)((writePos+FrameBlockSize-1) /
-                                           FrameBlockSize * BlockSize);
-                }
+                offset = (ALdouble)(readPos / FrameBlockSize * BlockSize);
             }
             else
             {
                 ALuint FrameSize = FrameSizeFromUserFmt(Buffer->OriginalChannels, Buffer->OriginalType);
-                offset[0] = (ALdouble)(readPos * FrameSize);
-                offset[1] = (ALdouble)(writePos * FrameSize);
+                offset = (ALdouble)(readPos * FrameSize);
             }
             break;
     }
 
     ReadUnlock(&Source->queue_lock);
+    return offset;
 }
 
 
@@ -2927,10 +3268,10 @@ ALboolean ApplyOffset(ALsource *Source)
         if(bufferLen > offset-totalBufferLen)
         {
             /* Offset is in this buffer */
-            ATOMIC_STORE(&Source->current_buffer, BufferList);
+            ATOMIC_STORE(&Source->current_buffer, BufferList, almemory_order_relaxed);
 
-            Source->position = offset - totalBufferLen;
-            Source->position_fraction = frac;
+            ATOMIC_STORE(&Source->position, offset - totalBufferLen, almemory_order_relaxed);
+            ATOMIC_STORE(&Source->position_fraction, frac);
             return AL_TRUE;
         }
 
@@ -2969,7 +3310,8 @@ static ALboolean GetSampleOffset(ALsource *Source, ALuint *offset, ALuint *frac)
     }
     if(!Buffer)
     {
-        Source->Offset = -1.0;
+        Source->OffsetType = AL_NONE;
+        Source->Offset = 0.0;
         return AL_FALSE;
     }
 
@@ -3007,7 +3349,8 @@ static ALboolean GetSampleOffset(ALsource *Source, ALuint *offset, ALuint *frac)
         *frac = (ALuint)mind(dblfrac*FRACTIONONE, FRACTIONONE-1.0);
         break;
     }
-    Source->Offset = -1.0;
+    Source->OffsetType = AL_NONE;
+    Source->Offset = 0.0;
 
     return AL_TRUE;
 }
@@ -3019,30 +3362,13 @@ static ALboolean GetSampleOffset(ALsource *Source, ALuint *offset, ALuint *frac)
  */
 ALvoid ReleaseALSources(ALCcontext *Context)
 {
-    ALbufferlistitem *item;
     ALsizei pos;
-    ALuint j;
     for(pos = 0;pos < Context->SourceMap.size;pos++)
     {
         ALsource *temp = Context->SourceMap.array[pos].value;
         Context->SourceMap.array[pos].value = NULL;
 
-        item = ATOMIC_EXCHANGE(ALbufferlistitem*, &temp->queue, NULL);
-        while(item != NULL)
-        {
-            ALbufferlistitem *next = item->next;
-            if(item->buffer != NULL)
-                DecrementRef(&item->buffer->ref);
-            free(item);
-            item = next;
-        }
-
-        for(j = 0;j < MAX_SENDS;++j)
-        {
-            if(temp->Send[j].Slot)
-                DecrementRef(&temp->Send[j].Slot->ref);
-            temp->Send[j].Slot = NULL;
-        }
+        DeinitSource(temp);
 
         FreeThunkEntry(temp->id);
         memset(temp, 0, sizeof(*temp));

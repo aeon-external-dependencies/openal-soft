@@ -384,13 +384,13 @@ ALvoid MixSource(ALvoice *voice, ALsource *Source, ALCdevice *Device, ALuint Sam
     ALuint chan, j;
 
     /* Get source info */
-    State          = Source->state;
+    State          = AL_PLAYING; /* Only called while playing. */
     BufferListItem = ATOMIC_LOAD(&Source->current_buffer);
-    DataPosInt     = Source->position;
-    DataPosFrac    = Source->position_fraction;
-    Looping        = Source->Looping;
+    DataPosInt     = ATOMIC_LOAD(&Source->position, almemory_order_relaxed);
+    DataPosFrac    = ATOMIC_LOAD(&Source->position_fraction, almemory_order_relaxed);
     NumChannels    = Source->NumChannels;
     SampleSize     = Source->SampleSize;
+    Looping        = voice->Looping;
     increment      = voice->Step;
 
     IrSize = (Device->Hrtf ? GetHrtfIrSize(Device->Hrtf) : 0);
@@ -603,6 +603,8 @@ ALvoid MixSource(ALvoice *voice, ALsource *Source, ALCdevice *Device, ALuint Sam
                 else
                 {
                     MixHrtfParams hrtfparams;
+                    int lidx, ridx;
+
                     if(!Counter)
                     {
                         parms->Hrtf[chan].Current = parms->Hrtf[chan].Target;
@@ -633,7 +635,11 @@ ALvoid MixSource(ALvoice *voice, ALsource *Source, ALCdevice *Device, ALuint Sam
                     hrtfparams.Target = &parms->Hrtf[chan].Target;
                     hrtfparams.Current = &parms->Hrtf[chan].Current;
 
-                    MixHrtfSamples(parms->OutBuffer, samples, Counter, voice->Offset,
+                    lidx = GetChannelIdxByName(Device->RealOut, FrontLeft);
+                    ridx = GetChannelIdxByName(Device->RealOut, FrontRight);
+                    assert(lidx != -1 && ridx != -1);
+
+                    MixHrtfSamples(parms->OutBuffer, lidx, ridx, samples, Counter, voice->Offset,
                                    OutPos, IrSize, &hrtfparams, &parms->Hrtf[chan].State,
                                    DstBufferSize);
                 }
@@ -746,8 +752,8 @@ ALvoid MixSource(ALvoice *voice, ALsource *Source, ALCdevice *Device, ALuint Sam
     voice->Moving = AL_TRUE;
 
     /* Update source info */
-    Source->state             = State;
-    ATOMIC_STORE(&Source->current_buffer, BufferListItem);
-    Source->position          = DataPosInt;
-    Source->position_fraction = DataPosFrac;
+    Source->state = State;
+    ATOMIC_STORE(&Source->current_buffer,    BufferListItem, almemory_order_relaxed);
+    ATOMIC_STORE(&Source->position,          DataPosInt, almemory_order_relaxed);
+    ATOMIC_STORE(&Source->position_fraction, DataPosFrac);
 }
