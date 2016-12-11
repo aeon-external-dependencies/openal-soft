@@ -236,11 +236,11 @@ IF(NOT CMAKE_BUILD_TYPE)
         "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel."
         FORCE)
 ENDIF()
-IF(NOT CMAKE_DEBUG_POSTFIX)
-    SET(CMAKE_DEBUG_POSTFIX "" CACHE STRING
-        "Library postfix for debug builds. Normally left blank."
-        FORCE)
-ENDIF()
+#IF(NOT CMAKE_DEBUG_POSTFIX)
+#    SET(CMAKE_DEBUG_POSTFIX "" CACHE STRING
+#        "Library postfix for debug builds. Normally left blank."
+#        FORCE)
+#ENDIF()
 
 IF(MSVC)
     ADD_DEFINITIONS(-D_CRT_SECURE_NO_WARNINGS)
